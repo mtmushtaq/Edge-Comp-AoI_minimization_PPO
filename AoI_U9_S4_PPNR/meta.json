@@ -1,0 +1,10 @@
+{
+  "M_total": 9,
+  "num_slots": 4,
+  "num_episodes": 50,
+  "frames_per_episode": null,
+  "seed": 42,
+  "torch_seed": 42,
+  "np_seed_state": "42",
+  "notes": "PPO AoI run"
+}
