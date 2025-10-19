@@ -923,41 +923,82 @@ def plot_policy_analytics_modern(
     sar_log_dir,
     M_total,
     num_slots,
-    out_dir="telemetry_plots",
+    out_dir=None,              # if None, saves alongside SAR log dir
     n_bins_profile=30,
-    roll_smooth=3,        # moving average smoothing over adjacent bins (>=1)
-    jitter=0.08,          # raincloud jitter (x-direction)
-    hex_gridsize=35,      # hexbin resolution per panel
+    roll_smooth=3,
+    jitter=0.08,
+    hex_gridsize=35,
     dpi=150,
+    # styling / behavior
+    pretty_labels=True,
+    xclip_quantiles=(0.5, 99.5),
+    hex_min_percentile=60,
+    hex_mincnt=3,
+    make_decision_strips=True,
+    make_policy_contours=True,
+    contour_bins=60,
+    contour_sigma=1.2,
 ):
     """
-    Modern, interpretable policy visuals (no heatmaps):
-      1) Policy profiles with confidence bands: P(a | AoI_near), P(a | AoI_far)
-      2) Raincloud distributions (violin + box + jitter) for AoI_near and AoI_far per action
-      3) Hex-multiples density: (AoI_near, AoI_far) points for each action
-
-    Loads: {sar_log_dir}/sar_logU{M_total}S{num_slots}.pkl
-    Saves : *_U{M_total}S{num_slots}.pdf under out_dir
+    Colorful policy analytics:
+      1) Policy profiles with bands: P(a | AoI_near), P(a | AoI_far)
+      2) Rainclouds (violin + box + jitter) by action
+      3) Hex-multiples (focused, log-scaled, de-noised)
+      4) Decision strips (sorted AoI, colored by action)
+      5) Smoothed 2D policy contours (frontiers)
+    Saves in the SAME directory as the SAR log by default.
     """
     import os, pickle, math
     import numpy as np
     import matplotlib as mpl
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm, ListedColormap, BoundaryNorm
 
-    # ---------- Paths & style ----------
+    # ---------- Paths ----------
+    if out_dir is None:
+        out_dir = sar_log_dir
     os.makedirs(out_dir, exist_ok=True)
     sar_log_path = os.path.join(sar_log_dir, f"sar_logU{M_total}S{num_slots}.pkl")
     if not os.path.exists(sar_log_path):
         raise FileNotFoundError(f"Missing SAR log: {sar_log_path}")
 
+    # ---------- Global style ----------
     mpl.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "STIXGeneral", "TeX Gyre Termes"],
-        "mathtext.fontset": "stix", "axes.unicode_minus": False, "pdf.use14corefonts": True,
+        "mathtext.fontset": "stix",
+        "axes.unicode_minus": False,
+        "pdf.use14corefonts": True,
         "axes.labelsize": 8, "xtick.labelsize": 7, "ytick.labelsize": 7,
-        "axes.linewidth": 0.8, "lines.linewidth": 1.1, "grid.linewidth": 0.5,
+        "axes.linewidth": 0.8, "lines.linewidth": 1.3, "grid.linewidth": 0.5,
         "xtick.major.width": 0.6, "ytick.major.width": 0.6,
     })
+
+    # ---------- Color palette ----------
+    # A long, vibrant set of distinct, publication-safe colors (cycled if K > len base)
+    BASE_COLORS = [
+        "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+        "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+        "#1F77B4", "#FF7F0E", "#2CA02C", "#D62728", "#9467BD",
+        "#8C564B", "#E377C2", "#7F7F7F", "#BCBD22", "#17BECF",
+    ]
+    def distinct_colors(K):
+        if K <= len(BASE_COLORS):
+            return BASE_COLORS[:K]
+        cols = []
+        i = 0
+        while len(cols) < K:
+            cols.append(BASE_COLORS[i % len(BASE_COLORS)])
+            i += 1
+        return cols
+
+    BAND_ALPHA = 0.18
+    ACCENT_DARK = "#4B4453"  # titles/lines; neutral-dark
+
+    def _lbl_near():
+        return r"AoI$_{\mathrm{near}}$" if pretty_labels else "Near-user AoI"
+    def _lbl_far():
+        return r"AoI$_{\mathrm{far}}$"  if pretty_labels else "Far-user AoI"
 
     # ---------- Load SAR ----------
     with open(sar_log_path, "rb") as f:
@@ -990,16 +1031,16 @@ def plot_policy_analytics_modern(
     AoI_n, AoI_f, A = AoI_n[mask], AoI_f[mask], A[mask]
     actions_unique = np.sort(np.unique(A))
     K = len(actions_unique)
+    COLORS = distinct_colors(K)
+    act2idx = {a:i for i,a in enumerate(actions_unique)}
+    def col_of(a): return COLORS[act2idx[a]]
 
-    # ---------- helper: binned profile with SE bands ----------
+    # ---------- helpers ----------
     def _profile(x, a, n_bins):
-        # Bin by quantiles to balance data per bin (more stable probabilities)
         qs = np.linspace(0, 1, n_bins + 1)
         edges = np.quantile(x, qs)
-        # ensure strictly increasing edges
         edges = np.unique(edges)
         if len(edges) - 1 < max(5, n_bins//2):
-            # fallback uniform if too many ties
             edges = np.linspace(np.min(x), np.max(x), n_bins + 1)
         centers = 0.5 * (edges[:-1] + edges[1:])
         p = np.zeros(len(centers))
@@ -1009,75 +1050,74 @@ def plot_policy_analytics_modern(
             n[i] = m.sum()
             if n[i] > 0:
                 p[i] = (A[m] == a).mean()
-        # smooth by simple moving average if desired
-        if roll_smooth > 1:
-            w = roll_smooth
-            def ma(v):
-                if len(v) < w: return v
-                pad = w//2
+        if roll_smooth > 1 and len(centers) >= roll_smooth:
+            w = roll_smooth; pad = w//2
+            def _ma(v):
                 vv = np.pad(v, (pad, pad), mode="edge")
                 out = np.convolve(vv, np.ones(w)/w, mode="valid")
                 return out[:len(v)]
-            p = ma(p); n = np.maximum(ma(n.astype(float)), 1e-12)
-
-        # binomial 95% CI via normal approx
+            p = _ma(p); n = np.maximum(_ma(n.astype(float)), 1e-12)
         se = np.sqrt(np.maximum(p * (1 - p) / np.maximum(n, 1), 1e-12))
         lo, hi = np.clip(p - 1.96 * se, 0, 1), np.clip(p + 1.96 * se, 0, 1)
-        return centers, p, lo, hi, n
+        return centers, p, lo, hi
 
-    # ---------- (1) Policy profiles with confidence bands ----------
+    def _robust_limits(x):
+        lo, hi = np.nanpercentile(x, xclip_quantiles)
+        if not np.isfinite(lo): lo = np.nanmin(x)
+        if not np.isfinite(hi): hi = np.nanmax(x)
+        if lo == hi: hi = lo + 1e-9
+        return lo, hi
+
+    # ---------- (1) Policy profiles ----------
     def _policy_profiles(x, x_label, tag):
         fig, ax = plt.subplots(figsize=(7.6, 4.0), dpi=dpi)
         for a in actions_unique:
-            c, p, lo, hi, n = _profile(x, a, n_bins_profile)
-            ax.plot(c, p, label=f"a={a}", linewidth=1.4)
-            ax.fill_between(c, lo, hi, alpha=0.18, linewidth=0)
-        ax.set_xlabel(x_label); ax.set_ylabel("P(action | AoI)")
-        ax.set_title(f"Policy Profiles vs {x_label}")
+            c, p, lo, hi = _profile(x, a, n_bins_profile)
+            ax.plot(c, p, color=col_of(a), label=f"a={a}", linewidth=1.8)
+            ax.fill_between(c, lo, hi, color=col_of(a), alpha=BAND_ALPHA, linewidth=0)
+        ax.set_xlabel(x_label); ax.set_ylabel(r"$P(\mathrm{action}\mid \mathrm{AoI})$")
+        ax.set_title(f"Policy Profiles vs {x_label}", color=ACCENT_DARK)
         ax.grid(True, alpha=0.35)
-        ax.legend(title="Actions", ncols=min(K, 4), fontsize=7)
+        ax.legend(title="Actions", ncols=min(K, 4), fontsize=7, frameon=False)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"policy_profiles_{tag}_U{M_total}S{num_slots}.pdf"),
                     format="pdf", dpi=600, bbox_inches="tight")
         plt.close(fig)
 
-    _policy_profiles(AoI_n, "AoI_near (state[0])", "AoIn")
-    _policy_profiles(AoI_f, "AoI_far (state[1])", "AoIf")
+    _policy_profiles(AoI_n, _lbl_near(), "AoIn")
+    _policy_profiles(AoI_f, _lbl_far(),  "AoIf")
 
-    # ---------- (2) Rainclouds (violin + box + jitter) ----------
+    # ---------- (2) Rainclouds ----------
     def _raincloud(x, x_label, tag):
-        # Build per-action lists
         groups = [x[A == a] for a in actions_unique]
         fig, ax = plt.subplots(figsize=(7.6, 3.8), dpi=dpi)
         parts = ax.violinplot(groups, showmeans=False, showmedians=False, showextrema=False)
-        # soften violin faces
-        for pc in parts['bodies']:
+        for i, pc in enumerate(parts['bodies']):
+            pc.set_facecolor(COLORS[i])
+            pc.set_edgecolor('none')
             pc.set_alpha(0.28)
-        # box markers
         for i, g in enumerate(groups, start=1):
             if len(g) == 0: continue
             q1, med, q3 = np.percentile(g, [25, 50, 75])
-            ax.plot([i-0.15, i+0.15], [med, med], lw=1.6)               # median line
-            ax.plot([i, i], [q1, q3], lw=3.0, alpha=0.9)                # IQR bar
-            # jitter points (subsample large sets)
+            ax.plot([i-0.15, i+0.15], [med, med], lw=1.9, color=COLORS[i-1])  # median
+            ax.plot([i, i], [q1, q3], lw=3.0, alpha=0.95, color=COLORS[i-1])  # IQR
             idx = np.arange(len(g))
             if len(idx) > 800: idx = np.random.choice(idx, 800, replace=False)
             xjit = i + (np.random.rand(len(idx)) - 0.5) * jitter
-            ax.plot(xjit, g[idx], "o", ms=1.6, alpha=0.35, linestyle="None")
+            ax.plot(xjit, g[idx], "o", ms=1.6, alpha=0.35, linestyle="None", color=COLORS[i-1])
         ax.set_xticks(range(1, K+1)); ax.set_xticklabels([f"a={a}" for a in actions_unique])
         ax.set_xlabel("Action"); ax.set_ylabel(x_label)
-        ax.set_title(f"Raincloud: {x_label} by Action")
+        ax.set_title(f"Raincloud: {x_label} by Action", color=ACCENT_DARK)
         ax.grid(True, axis="y", alpha=0.25)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"raincloud_{tag}_U{M_total}S{num_slots}.pdf"),
                     format="pdf", dpi=600, bbox_inches="tight")
         plt.close(fig)
 
-    _raincloud(AoI_n, "AoI_near (state[0])", "AoIn")
-    _raincloud(AoI_f, "AoI_far (state[1])", "AoIf")
+    _raincloud(AoI_n, _lbl_near(), "AoIn")
+    _raincloud(AoI_f, _lbl_far(),  "AoIf")
 
-    # ---------- (3) Hex-multiples density per action ----------
-    # Small multiples layout (<=3 columns)
+    # ---------- (3) Hex-multiples (focused, denoised) ----------
     ncols = min(3, K); nrows = math.ceil(K / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.2*ncols, 2.8*nrows), dpi=dpi, squeeze=False)
     for i, a in enumerate(actions_unique):
@@ -1085,28 +1125,118 @@ def plot_policy_analytics_modern(
         ax = axes[r, c]
         m = (A == a)
         if m.sum() > 0:
-            hb = ax.hexbin(AoI_n[m], AoI_f[m], gridsize=hex_gridsize, mincnt=1)
-            cb = fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.04)
-            cb.set_label("Count")
-        ax.set_title(f"Action a={a}", fontsize=8)
-        ax.set_xlabel("AoI_near (state[0])"); ax.set_ylabel("AoI_far (state[1])")
+            xv, yv = AoI_n[m], AoI_f[m]
+            xlo, xhi = _robust_limits(xv)
+            ylo, yhi = _robust_limits(yv)
+            # colorful, perceptually-uniform colormap for density
+            hb = ax.hexbin(
+                xv, yv,
+                gridsize=hex_gridsize,
+                mincnt=max(1, int(hex_mincnt)),
+                norm=LogNorm(),
+                cmap="viridis",
+            )
+            counts = hb.get_array()
+            if counts.size:
+                thr = np.percentile(counts, hex_min_percentile)
+                hb.set_clim(vmin=max(thr, 1))   # hide low-density bins
+                cmap = hb.get_cmap().copy()
+                cmap.set_under(alpha=0.0)
+                hb.set_cmap(cmap)
+            ax.set_xlim(xlo, xhi); ax.set_ylim(ylo, yhi)
+        ax.set_title(f"Action a={a}", fontsize=8, color=ACCENT_DARK)
+        ax.set_xlabel(_lbl_near()); ax.set_ylabel(_lbl_far())
         ax.grid(True, alpha=0.2)
-    # empty panels off
     for j in range(K, nrows*ncols):
         r, c = divmod(j, ncols)
         axes[r, c].axis("off")
-    fig.suptitle("Hex Density of (AoI_near, AoI_far) per Action", y=0.995, fontsize=9)
+    fig.suptitle("Hex Density of (AoI_near, AoI_far) per Action", y=0.995, fontsize=9, color=ACCENT_DARK)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(os.path.join(out_dir, f"hex_multiples_U{M_total}S{num_slots}.pdf"),
                 format="pdf", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
-    print("[PLOT] Saved:",
-          os.path.join(out_dir, f"policy_profiles_AoIn_U{M_total}S{num_slots}.pdf"),
-          os.path.join(out_dir, f"policy_profiles_AoIf_U{M_total}S{num_slots}.pdf"),
-          os.path.join(out_dir, f"raincloud_AoIn_U{M_total}S{num_slots}.pdf"),
-          os.path.join(out_dir, f"raincloud_AoIf_U{M_total}S{num_slots}.pdf"),
-          os.path.join(out_dir, f"hex_multiples_U{M_total}S{num_slots}.pdf"))
+    # ---------- (4) Decision strips ----------
+    if make_decision_strips:
+        def _strip(x, x_label, tag):
+            order = np.argsort(x)
+            a_sorted = A[order]
+            colors = np.array([COLORS[act2idx[a]] for a in a_sorted])
+            fig, ax = plt.subplots(figsize=(7.6, 1.6), dpi=dpi)
+            ax.scatter(np.arange(a_sorted.size), np.zeros_like(a_sorted),
+                       c=colors, s=2, marker='s', linewidths=0)
+            ax.set_yticks([])
+            ax.set_xlabel(x_label)
+            ax.set_title(f"Decision Strip vs {x_label} (color = action)", color=ACCENT_DARK)
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, f"decision_strip_{tag}_U{M_total}S{num_slots}.pdf"),
+                        format="pdf", dpi=600, bbox_inches="tight")
+            plt.close(fig)
+        _strip(AoI_n, _lbl_near(), "AoIn")
+        _strip(AoI_f, _lbl_far(),  "AoIf")
+
+    # ---------- (5) Smoothed 2D policy contours ----------
+    if make_policy_contours and K >= 2:
+        def _gaussian_kernel1d(sigma, radius):
+            x = np.arange(-radius, radius+1, dtype=float)
+            k = np.exp(-(x*x)/(2*sigma*sigma))
+            k /= k.sum()
+            return k
+        def _blur2d(arr, sigma):
+            if sigma <= 0: return arr
+            radius = int(max(1, round(3*sigma)))
+            k = _gaussian_kernel1d(sigma, radius)
+            tmp = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, arr)
+            out = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 0, tmp)
+            return out
+
+        def _edges(v):
+            lo, hi = _robust_limits(v)
+            return np.linspace(lo, hi, contour_bins+1)
+
+        xe, ye = _edges(AoI_n), _edges(AoI_f)
+        ix = np.clip(np.digitize(AoI_n, xe)-1, 0, contour_bins-1)
+        iy = np.clip(np.digitize(AoI_f, ye)-1, 0, contour_bins-1)
+
+        counts = np.zeros((K, contour_bins, contour_bins), dtype=float)
+        for cx, cy, a in zip(ix, iy, A):
+            counts[act2idx[a], cx, cy] += 1.0
+
+        probs = np.zeros_like(counts)
+        for k_idx in range(K):
+            probs[k_idx] = _blur2d(counts[k_idx], contour_sigma)
+        denom = np.maximum(probs.sum(axis=0), 1e-12)
+        probs /= denom
+
+        Xc = 0.5*(xe[:-1] + xe[1:])
+        Yc = 0.5*(ye[:-1] + ye[1:])
+        Xg, Yg = np.meshgrid(Xc, Yc, indexing="ij")
+
+        # region coloring with action colors
+        region = np.argmax(probs, axis=0)  # [X,Y] in {0..K-1}
+        region_cmap = ListedColormap(COLORS)
+        norm = BoundaryNorm(np.arange(-0.5, K+0.5, 1), K)
+
+        fig, ax = plt.subplots(figsize=(6.8, 5.4), dpi=dpi)
+        ax.contourf(Xg, Yg, region.T, levels=np.arange(-0.5, K+0.5, 1),
+                    cmap=region_cmap, norm=norm, alpha=0.35)
+
+        # draw p=0.5 contours per action in that action's line color
+        for k_idx, a in enumerate(actions_unique):
+            try:
+                ax.contour(Xg, Yg, probs[k_idx].T, levels=[0.5],
+                           colors=[col_of(a)], linewidths=1.6)
+            except Exception:
+                pass
+
+        ax.set_xlabel(_lbl_near()); ax.set_ylabel(_lbl_far())
+        ax.set_title("Smoothed Policy Frontiers", color=ACCENT_DARK)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, f"policy_contours_U{M_total}S{num_slots}.pdf"),
+                    format="pdf", dpi=600, bbox_inches="tight")
+        plt.close(fig)
+
+    print("[PLOT] Saved to:", out_dir)
 
 def compute_user_moving_avgs(data, num_slots, frames_per_episode, num_episodes):
     """
@@ -1286,10 +1416,10 @@ def make_run_dir(M_total, num_slots):
 
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 5
+num_slots          = 6
 frames_per_episode = 1000
 num_episodes       = 30
-M_total            = 15
+M_total            = 18
 
 # if you used a manual seed somewhere, define it here once
 seed = 42
@@ -1351,12 +1481,7 @@ plot_policy_analytics_modern(
     sar_log_dir=RUN_DIR,
     M_total=M_total,
     num_slots=num_slots,
-    out_dir=RUN_DIR,
-
-    n_bins_profile=20,   # try 25–50
-    roll_smooth=30 ,
-    dpi= 600# set 1 to disable smoothing
-
+    pretty_labels=True
 )
 
 

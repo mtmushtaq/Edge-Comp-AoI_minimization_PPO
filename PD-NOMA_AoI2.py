@@ -167,10 +167,10 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 5
+num_slots          = 6
 frames_per_episode = 1000
 num_episodes       = 30
-M_total            = 15
+M_total            = 18
 K_clusters         = 5
 KF_clusters        = 4
 K_r_user           = 12.0
@@ -190,12 +190,12 @@ tau                = D / np.sqrt(2.0)  # near/far threshold by your spec
 
 # ------------------- PPO params (plottable & stable) -------------------
 state_dim    = 12        # [A_near, A_far, dA_near, dA_far, success_near, success_far]
-lr           = 1e-4     # stable default
-ppo_epochs   = 3
-batch_size_I   = 350
+lr           = 1e-2     # stable default
+ppo_epochs   = 2
+batch_size_I   = 200
 gamma_I        = 0.99
-lam_I          = 0.95
-clip_range_I   = 0.01
+lam_I          = 0.9
+clip_range_I   = 0.1
 ent_coef_I     = 0.01
 vf_coef_I      = 0.5
 max_grad_norm_I= 0.1
