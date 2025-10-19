@@ -1409,14 +1409,14 @@ def plot_system_avg_aoi_timewise_strict(
 
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_P"
+    name = f"AoI_U{M_total}_S{num_slots}_GTH2"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
 
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 6
+num_slots          = 8
 frames_per_episode = 1000
 num_episodes       = 30
 M_total            = 18

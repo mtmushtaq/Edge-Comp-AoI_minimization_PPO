@@ -167,11 +167,11 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 6
+num_slots          = 8
 frames_per_episode = 1000
 num_episodes       = 30
 M_total            = 18
-K_clusters         = 5
+K_clusters         = 3
 KF_clusters        = 4
 K_r_user           = 12.0
 alpha_c            = 0.25
@@ -180,7 +180,7 @@ delta_wet          = 0.001
 delta_wit          = 0.001
 P_HAP              = 1.0
 noise_pow          = 0.002
-gamma_th_db        = 0
+gamma_th_db        = 2
 gamma_th           = 10 ** (gamma_th_db / 10.0)
 v_L                = 0.5
 v_H                = gamma_th * (1.0 + v_L)
@@ -757,24 +757,33 @@ def assign_slots_ppo(policy, device, users, num_slots, build_pair_state, candida
 
 
 def build_pair_state(uN, uF):
-    A_n, A_f = float(uN.aoi), float(uF.aoi)
-    dA_n = float(uN.delta_aoi_prev)
-    dA_f = float(uF.delta_aoi_prev)
-    dec_n, dec_f = float(uN.last_decoded_slot), float(uF.last_decoded_slot)
-    dist_n, dist_f = float(uN.d), float(uF.d)
-    belief_e_n, belief_e_f = float(uN.belief_energy), float(uF.belief_energy)
-    psucc_n, psucc_f = float(uN.belief_psuccess), float(uF.belief_psuccess)
+    import numpy as np
 
-    return np.array([
+    def _safe(x, lo=-1e6, hi=1e6):
+        x = float(x)
+        if not np.isfinite(x): return 0.0
+        return float(np.clip(x, lo, hi))
+
+    A_n, A_f = _safe(uN.aoi, 0, 1e6), _safe(uF.aoi, 0, 1e6)
+    dA_n, dA_f = _safe(uN.delta_aoi_prev, -1e6, 1e6), _safe(uF.delta_aoi_prev, -1e6, 1e6)
+    dec_n, dec_f = _safe(uN.last_decoded_slot, 0, 1e6), _safe(uF.last_decoded_slot, 0, 1e6)
+    dist_n, dist_f = _safe(uN.d, 0, 1e6), _safe(uF.d, 0, 1e6)
+    belief_e_n, belief_e_f = _safe(uN.belief_energy, 0, 1e6), _safe(uF.belief_energy, 0, 1e6)
+    psucc_n, psucc_f = _safe(uN.belief_psuccess, 0, 1), _safe(uF.belief_psuccess, 0, 1)
+
+    s = np.array([
         A_n, A_f, dA_n, dA_f, dec_n, dec_f, dist_n, dist_f,
         belief_e_n, belief_e_f, psucc_n, psucc_f
     ], dtype=np.float32)
 
+    # last line of defense:
+    s = np.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
+    return s
 
 
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_P"
+    name = f"AoI_U{M_total}_S{num_slots}_GTH{gamma_th_db}"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
@@ -817,7 +826,6 @@ def to_slot_id(s, num_slots):
 
 import os
 import re
-import csv
 import math
 import torch
 import numpy as np
@@ -836,27 +844,63 @@ class PPOActorCritic(nn.Module):
         self.f1 = nn.Linear(state_dim, 128)
         self.f2 = nn.Linear(128, 128)
         self.pi = nn.Linear(128, n_slots)
-        self.v = nn.Linear(128, 1)
+        self.v  = nn.Linear(128, 1)
 
     def forward(self, states):
         x = F.relu(self.f1(states))
         x = F.relu(self.f2(x))
         logits = self.pi(x)
-        value = self.v(x).squeeze(-1)
+        value  = self.v(x).squeeze(-1)
         return logits, value
 
     @torch.no_grad()
     def act(self, state, slot_mask, greedy=False):
+        """
+        Safe masked policy:
+          - sanitize state/logits (nan_to_num)
+          - masked softmax (mask=0 → -inf) so no renorm divide-by-zero
+          - fallback to uniform over available slots if all masked or bad
+        """
+        # 1) sanitize state (in case env/state construction produced NaN/Inf)
+        state = torch.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+
         logits, value = self.forward(state)
-        probs = torch.softmax(logits + EPS, dim=-1) * slot_mask
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 2) masked softmax (stable): invalid slots get -inf before softmax
+        mask = slot_mask.to(dtype=logits.dtype)
+        # if mask has no valid entries, we’ll fix below
+        very_neg = torch.finfo(logits.dtype).min
+        masked_logits = logits.masked_fill(mask < 0.5, very_neg)
+
+        # subtract max for stability
+        max_logits = masked_logits.max(dim=-1, keepdim=True).values
+        masked_logits = masked_logits - max_logits
+
+        probs = torch.softmax(masked_logits, dim=-1)  # already respects mask
+        probs = torch.nan_to_num(probs, nan=0.0)
+
+        # 3) fallback if everything was masked or probs degenerated
+        sum_probs = probs.sum(dim=-1, keepdim=True)
+        bad = (sum_probs <= 0) | ~torch.isfinite(sum_probs)
+        if bad.any():
+            # try uniform over available slots
+            avail = (mask > 0.5).to(probs.dtype)
+            denom = avail.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs = avail / denom
+            # if STILL all zeros (no available slots), fall back to argmax(logits) ignoring mask
+            still_bad = (probs.sum(dim=-1, keepdim=True) <= 0)
+            if still_bad.any():
+                # one-hot at global argmax (last resort)
+                idx = torch.argmax(logits, dim=-1)
+                probs = torch.zeros_like(logits)
+                probs.scatter_(1, idx.unsqueeze(-1), 1.0)
+
         dist = Categorical(probs)
-        if greedy:
-            a = torch.argmax(probs, dim=-1)
-        else:
-            a = dist.sample()
+        a = torch.argmax(probs, dim=-1) if greedy else dist.sample()
         logp = dist.log_prob(a)
         return a, logp, value, probs
+
 
 class Telemetry:
     def __init__(self):
@@ -1126,6 +1170,15 @@ def assign_slots_for_frame(
         else:
             eps = 0.0
             greedy_now = greedy_act
+
+        # ensure there's at least one free slot
+        if torch.count_nonzero(slot_mask) == 0:
+            # all taken (shouldn’t normally happen before the loop break)
+            free = [ss for ss in range(num_slots) if ss not in taken]
+            if not free:
+                break
+            # open one slot to avoid all-zero mask
+            slot_mask[0, free[0]] = 1.0
 
         a, logp_t, v_t, _ = policy.act(s, slot_mask, greedy=greedy_now)
         slot_idx = int(a.item())
@@ -2201,7 +2254,7 @@ plot_moving_avg_aoi_per_user(
 )
 plot_system_avg_aoi(data, num_slots=num_slots, frames_per_episode=frames_per_episode,  out_dir=RUN_DIR, out_pdf="system_avg_aoicluster2.pdf")
 
-plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=10)
+#plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=10)
 
 plot_time_averaged_system_aoi(data, num_slots, frames_per_episode, RUN_DIR, out_pdf="system_aoi_time_avg.pdf")
 
