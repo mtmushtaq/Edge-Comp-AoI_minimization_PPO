@@ -1,0 +1,51 @@
+### Simulation Run Settings — 2025-10-19 21:16:29
+
+# ------------------- Environment Params -------------------
+max_battery       = 2.0
+num_slots          = 8
+frames_per_episode = 1000
+num_episodes       = 30
+M_total            = 18
+K_clusters         = 3
+KF_clusters        = 4
+K_r_user           = 12.0
+alpha_c            = 0.25
+beta_c             = 1.0
+delta_wet          = 0.001
+delta_wit          = 0.001
+P_HAP              = 1.0
+noise_pow          = 0.002
+gamma_th_db        = 0
+gamma_th           = 1.000000
+v_L                = 0.5
+v_H                = 1.500000
+drop_prob          = 0.6
+D                  = 8.0
+tau                = 5.65685424949238
+
+# ------------------- PPO Params -------------------
+state_dim          = 12
+lr                 = 0.01
+ppo_epochs         = 2
+batch_size_I       = 200
+gamma_I            = 0.99
+lam_I              = 0.9
+clip_range_I       = 0.1
+ent_coef_I         = 0.01
+vf_coef_I          = 0.5
+max_grad_norm_I    = 0.1
+epsilon            = 0.5
+EPS                = 1e-08
+
+# ---- Early Stop Configuration ----
+PI_TARGET          = 0.001
+PI_TOL             = 0.005
+PI_PATIENCE        = 2
+SAVE_NAME          = "best_policy.pt"
+EVAL_EPISODES      = 30
+
+# ---- Greedy ε-Greedy Actions ----
+epsilon_start      = 0.25
+epsilon_final      = 0.005
+decay_steps        = 500000
+global_step        = 0

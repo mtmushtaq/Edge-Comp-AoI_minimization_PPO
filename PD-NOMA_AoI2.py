@@ -180,13 +180,14 @@ delta_wet          = 0.001
 delta_wit          = 0.001
 P_HAP              = 1.0
 noise_pow          = 0.002
-gamma_th_db        = 2
+gamma_th_db        = 0
 gamma_th           = 10 ** (gamma_th_db / 10.0)
 v_L                = 0.5
 v_H                = gamma_th * (1.0 + v_L)
 drop_prob          = 0.6
 D                  = 8.0
 tau                = D / np.sqrt(2.0)  # near/far threshold by your spec
+battery_max = 0.005
 
 # ------------------- PPO params (plottable & stable) -------------------
 state_dim    = 12        # [A_near, A_far, dA_near, dA_far, success_near, success_far]
@@ -220,6 +221,87 @@ epsilon_final = 0.005   # floor
 decay_steps   = 500000 # decisions/frames to reach the floor (tune as you like)
 global_step = 0  # increment this once per decision (or per slot), not per episode
 
+import os, datetime, numpy as np
+
+def save_run_settings(
+    out_dir,
+    num_slots, frames_per_episode, num_episodes,
+    M_total, K_clusters, KF_clusters, K_r_user,
+    alpha_c, beta_c, delta_wet, delta_wit, P_HAP, noise_pow,
+    gamma_th_db, v_L, drop_prob, D, tau,
+    state_dim, lr, ppo_epochs, batch_size_I, gamma_I, lam_I,
+    clip_range_I, ent_coef_I, vf_coef_I, max_grad_norm_I, epsilon,
+    EPS, PI_TARGET, PI_TOL, PI_PATIENCE, SAVE_NAME, EVAL_EPISODES,
+    epsilon_start, epsilon_final, decay_steps, global_step, max_battery=battery_max
+):
+    """
+    Save current environment + PPO settings to a text file in the same directory.
+    Creates:  <out_dir>/run_settings.txt
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "run_settings.txt")
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    gamma_th = 10 ** (gamma_th_db / 10.0)
+    v_H = gamma_th * (1.0 + v_L)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"### Simulation Run Settings — {now}\n\n")
+
+        f.write("# ------------------- Environment Params -------------------\n")
+        f.write(f"max_battery       = {max_battery}\n")
+        f.write(f"num_slots          = {num_slots}\n")
+        f.write(f"frames_per_episode = {frames_per_episode}\n")
+        f.write(f"num_episodes       = {num_episodes}\n")
+        f.write(f"M_total            = {M_total}\n")
+        f.write(f"K_clusters         = {K_clusters}\n")
+        f.write(f"KF_clusters        = {KF_clusters}\n")
+        f.write(f"K_r_user           = {K_r_user}\n")
+        f.write(f"alpha_c            = {alpha_c}\n")
+        f.write(f"beta_c             = {beta_c}\n")
+        f.write(f"delta_wet          = {delta_wet}\n")
+        f.write(f"delta_wit          = {delta_wit}\n")
+        f.write(f"P_HAP              = {P_HAP}\n")
+        f.write(f"noise_pow          = {noise_pow}\n")
+        f.write(f"gamma_th_db        = {gamma_th_db}\n")
+        f.write(f"gamma_th           = {gamma_th:.6f}\n")
+        f.write(f"v_L                = {v_L}\n")
+        f.write(f"v_H                = {v_H:.6f}\n")
+        f.write(f"drop_prob          = {drop_prob}\n")
+        f.write(f"D                  = {D}\n")
+        f.write(f"tau                = {tau}\n\n")
+
+        f.write("# ------------------- PPO Params -------------------\n")
+        f.write(f"state_dim          = {state_dim}\n")
+        f.write(f"lr                 = {lr}\n")
+        f.write(f"ppo_epochs         = {ppo_epochs}\n")
+        f.write(f"batch_size_I       = {batch_size_I}\n")
+        f.write(f"gamma_I            = {gamma_I}\n")
+        f.write(f"lam_I              = {lam_I}\n")
+        f.write(f"clip_range_I       = {clip_range_I}\n")
+        f.write(f"ent_coef_I         = {ent_coef_I}\n")
+        f.write(f"vf_coef_I          = {vf_coef_I}\n")
+        f.write(f"max_grad_norm_I    = {max_grad_norm_I}\n")
+        f.write(f"epsilon            = {epsilon}\n")
+        f.write(f"EPS                = {EPS}\n\n")
+
+        f.write("# ---- Early Stop Configuration ----\n")
+        f.write(f"PI_TARGET          = {PI_TARGET}\n")
+        f.write(f"PI_TOL             = {PI_TOL}\n")
+        f.write(f"PI_PATIENCE        = {PI_PATIENCE}\n")
+        f.write(f"SAVE_NAME          = \"{SAVE_NAME}\"\n")
+        f.write(f"EVAL_EPISODES      = {EVAL_EPISODES}\n\n")
+
+        f.write("# ---- Greedy ε-Greedy Actions ----\n")
+        f.write(f"epsilon_start      = {epsilon_start}\n")
+        f.write(f"epsilon_final      = {epsilon_final}\n")
+        f.write(f"decay_steps        = {decay_steps}\n")
+        f.write(f"global_step        = {global_step}\n")
+
+    print(f"[INFO] Saved run settings → {path}")
+    return path
+
 def epsilon_schedule(step):
     # linear decay
     if step >= decay_steps:
@@ -249,7 +331,7 @@ def sepl_gain(d, alpha_c, beta_c):
 
 # ------------------- User state -------------------
 class UserState:
-    def __init__(self, uid, d_init, energy_per_slot = 0.01):
+    def __init__(self, uid, d_init, energy_per_slot = 0.01, max_bat=2):
         self.uid = uid
         self.d = float(d_init)     # last-known distance (updated on success)
         self.h = None              # complex small-scale (sampled per frame)
@@ -262,7 +344,7 @@ class UserState:
         self.decode = 0.0
         self.v_assigned_target = None  # the v (v_H or v_L) used THIS frame if scheduled
         self.decode_prev = 0  # to store previous decoded state
-        self.max_bat = 5
+        self.max_bat = max_bat
         self.harvested = 0
         # --- NEW attributes for advanced policies ---
         self.last_slot_used = -1  # which slot this user was last assigned
@@ -783,7 +865,7 @@ def build_pair_state(uN, uF):
 
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_GTH{gamma_th_db}"
+    name = f"AoI_U{M_total}_S{num_slots}_BMX{battery_max}"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
@@ -1913,6 +1995,38 @@ with open(os.path.join(RUN_DIR, "meta.json"), "w") as f:
 
 print(f"[SAVE] Run dir created: {RUN_DIR}")
 
+settings_file = save_run_settings(
+    out_dir=RUN_DIR,
+
+    # --- Environment ---
+    num_slots=num_slots,
+    frames_per_episode=frames_per_episode,
+    num_episodes=num_episodes,
+    M_total=M_total,
+    K_clusters=K_clusters,
+    KF_clusters=KF_clusters,
+    K_r_user=K_r_user,
+    alpha_c=alpha_c, beta_c=beta_c,
+    delta_wet=delta_wet, delta_wit=delta_wit,
+    P_HAP=P_HAP, noise_pow=noise_pow,
+    gamma_th_db=gamma_th_db,
+    v_L=v_L, drop_prob=drop_prob, D=D, tau=tau, max_battery= battery_max,
+
+    # --- PPO ---
+    state_dim=state_dim, lr=lr, ppo_epochs=ppo_epochs,
+    batch_size_I=batch_size_I, gamma_I=gamma_I, lam_I=lam_I,
+    clip_range_I=clip_range_I, ent_coef_I=ent_coef_I,
+    vf_coef_I=vf_coef_I, max_grad_norm_I=max_grad_norm_I,
+    epsilon=epsilon, EPS=EPS,
+
+    # --- Early stop ---
+    PI_TARGET=PI_TARGET, PI_TOL=PI_TOL, PI_PATIENCE=PI_PATIENCE,
+    SAVE_NAME=SAVE_NAME, EVAL_EPISODES=EVAL_EPISODES,
+
+    # --- ε-Greedy schedule ---
+    epsilon_start=epsilon_start, epsilon_final=epsilon_final,
+    decay_steps=decay_steps, global_step=global_step
+)
 
 
 avg_aoi_hist = []
@@ -1936,7 +2050,7 @@ users = []
 # First half: near users, distance ∈ [1, D/2]
 for i in range(M_total // 2):
     d_init = np.random.uniform(1.0, D / 2)
-    users.append(UserState(f"U{i+1}", d_init=d_init))
+    users.append(UserState(f"U{i+1}", d_init=d_init, max_bat= battery_max))
 
 # Second half: far users, distance ∈ [D/2 + 0.1, D]
 for i in range(M_total // 2, M_total):

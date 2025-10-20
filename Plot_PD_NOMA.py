@@ -1407,9 +1407,210 @@ def plot_system_avg_aoi_timewise_strict(
     plt.close(fig)
     print(f"[PLOT] System AoI over time saved → {out_path}")
 
+def plot_system_avg_aoi_timewise_strict(
+    data,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir,
+    out_pdf="system_aoi_time_avg.pdf",
+    also_plot_mean_of_user_mavgs=True,
+    rolling_window=None,                # e.g., 1000 for a smoother auxiliary curve
+    # --- new knobs ---
+    include_per_slot_in_main=True,      # True -> keep thin per-slot mean in the main figure
+    save_avg_only=True,                 # True -> also save a second "averages-only" figure
+    avg_only_pdf="system_aoi_time_avg_only.pdf",
+    avg_ylim_clip=(1, 99),              # y-axis clips by percentiles of average curves for better scale
+):
+    """
+    Builds:
+      - per-slot mean AoI across users at each global t (O(N))
+      - running mean over time (AAoI-like system convergence)
+      - optional: mean of users' moving averages at each t (aligned & forward-filled)
+
+    Saves:
+      - main plot (optionally includes per-slot mean)
+      - averages-only plot (running mean, rolling mean, mean of user mavgs)
+    """
+    import os, numpy as np, matplotlib.pyplot as plt, matplotlib as mpl
+
+    # ------- styling -------
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "STIXGeneral", "TeX Gyre Termes"],
+        "mathtext.fontset": "stix", "axes.unicode_minus": False, "pdf.use14corefonts": True,
+        "axes.labelsize": 8, "xtick.labelsize": 7, "ytick.labelsize": 7,
+        "axes.linewidth": 0.8, "lines.linewidth": 1.1, "grid.linewidth": 0.5,
+        "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+    })
+
+    uids = sorted(data.keys())
+    U = len(uids)
+    T = num_slots * frames_per_episode
+    T_total = T * num_episodes
+
+    # --- A) Per-slot mean AoI across users (cross-sectional) ---
+    sum_per_t, cnt_per_t = {}, {}
+    for uid in uids:
+        rows = sorted(data[uid], key=lambda r: (r["ep"], r["frame"], r["slot"]))
+        for r in rows:
+            t = (r["ep"] - 1) * T + r["frame"] * num_slots + r["slot"]
+            aoi = float(r.get("aoi", 0.0))
+            sum_per_t[t] = sum_per_t.get(t, 0.0) + aoi
+            cnt_per_t[t] = cnt_per_t.get(t, 0) + 1
+
+    if not sum_per_t:
+        print("[PLOT] No data found; nothing to plot.")
+        return
+
+    t_sorted = np.array(sorted(sum_per_t.keys()), dtype=int)
+    max_t = int(min(t_sorted.max(), T_total))
+    per_slot_mean = np.full(max_t + 1, np.nan)
+    counts = np.zeros(max_t + 1, dtype=int)
+    for t in t_sorted:
+        if t <= max_t:
+            per_slot_mean[t] = sum_per_t[t] / max(cnt_per_t[t], 1)
+            counts[t] = cnt_per_t[t]
+
+    # forward-fill gaps so cumulative is stable (optional but helpful)
+    mask = np.isfinite(per_slot_mean)
+    if mask.any():
+        last = np.nan
+        for i in range(per_slot_mean.size):
+            if np.isfinite(per_slot_mean[i]):
+                last = per_slot_mean[i]
+            else:
+                per_slot_mean[i] = last
+
+    # Running (cumulative) mean over time (AAoI-like)
+    valid = np.isfinite(per_slot_mean)
+    ps = np.where(valid, per_slot_mean, 0.0)
+    w = np.where(valid, 1.0, 0.0)
+    csum = np.cumsum(ps)
+    wsum = np.cumsum(w)
+    system_running_mean = np.divide(csum, np.maximum(wsum, 1e-12))
+
+    # Optional rolling mean (centered simple moving average)
+    roll_curve = None
+    if rolling_window and rolling_window > 1:
+        k = int(rolling_window)
+        kernel = np.ones(k) / k
+        num = np.convolve(ps, kernel, mode="same")
+        den = np.convolve(w, kernel, mode="same")
+        roll_curve = np.divide(num, np.maximum(den, 1e-12))
+
+    # --- B) Mean of users' moving averages (built from exact per-user MAvgs) ---
+    mean_of_user_mavgs = None
+    if also_plot_mean_of_user_mavgs:
+        # expects compute_user_moving_avgs to be available in scope
+        user_series = compute_user_moving_avgs(data, num_slots, frames_per_episode, num_episodes)
+        mtx = np.full((U, max_t + 1), np.nan, dtype=float)
+        for ui, uid in enumerate(uids):
+            t_u = user_series[uid]["t"]
+            m_u = user_series[uid]["mavg"]
+            if t_u.size == 0:
+                continue
+            row = np.full(max_t + 1, np.nan, dtype=float)
+            row[t_u] = m_u
+            # forward-fill each user's series
+            last = np.nan
+            for i in range(max_t + 1):
+                if np.isfinite(row[i]):
+                    last = row[i]
+                else:
+                    row[i] = last
+            mtx[ui] = row
+        mean_of_user_mavgs = np.nanmean(mtx, axis=0)
+
+    # --- episode markers ---
+    x = np.arange(max_t + 1)
+    episode_boundaries = [i * T for i in range(0, num_episodes + 1)]
+
+    # ------------------ Figure 1: main (optionally with per-slot) ------------------
+    fig, ax = plt.subplots(figsize=(7.8, 3.2))
+    if include_per_slot_in_main:
+        ax.plot(x, per_slot_mean, linewidth=0.9, alpha=0.35, label="Per-slot mean AoI (across users)")
+    ax.plot(x, system_running_mean, linewidth=1.6, label="Running mean AoI (system)")
+    if roll_curve is not None:
+        ax.plot(x, roll_curve, linestyle="--", linewidth=1.2, label=f"Rolling mean (w={rolling_window})")
+    if mean_of_user_mavgs is not None:
+        ax.plot(x, mean_of_user_mavgs, linewidth=1.2, label="Mean of users' moving avgs")
+
+    for eb in episode_boundaries:
+        if eb <= max_t:
+            ax.axvline(eb, color="0.88", linewidth=0.7, zorder=0)
+
+    ax.set_xlim(0, max_t)
+    ax.set_xlabel("Slot Index")
+    ax.set_ylabel("AoI")
+    ax.set_title("System Average AoI Over Time")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False, fontsize=7, ncols=2)
+    fig.tight_layout()
+
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] System AoI over time saved → {out_path}")
+
+    # ------------------ Figure 2: averages-only (no per-slot) ------------------
+    if save_avg_only:
+        fig2, ax2 = plt.subplots(figsize=(7.8, 3.2))
+        lines = []
+        labels = []
+
+        l = ax2.plot(x, system_running_mean, linewidth=1.8, label="Running mean AoI (system)")[0]
+        lines.append(l); labels.append(l.get_label())
+
+        if roll_curve is not None:
+            l = ax2.plot(x, roll_curve, linestyle="--", linewidth=1.4,
+                         label=f"Rolling mean (w={rolling_window})")[0]
+            lines.append(l); labels.append(l.get_label())
+
+        if mean_of_user_mavgs is not None:
+            l = ax2.plot(x, mean_of_user_mavgs, linewidth=1.4,
+                         label="Mean of users' moving avgs")[0]
+            lines.append(l); labels.append(l.get_label())
+
+        for eb in episode_boundaries:
+            if eb <= max_t:
+                ax2.axvline(eb, color="0.9", linewidth=0.6, zorder=0)
+
+        ax2.set_xlim(0, max_t)
+        ax2.set_xlabel("Slot Index")
+        ax2.set_ylabel("AoI")
+        ax2.set_title("System AoI — Averages Only")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(frameon=False, fontsize=7, ncols=2)
+
+        # --- smart y-limits based only on the averages drawn ---
+        yvals = []
+        for ln in lines:
+            y = ln.get_ydata()
+            y = y[np.isfinite(y)]
+            if y.size:
+                yvals.append(y)
+        if yvals:
+            ystack = np.concatenate(yvals)
+            lo = np.percentile(ystack, avg_ylim_clip[0])
+            hi = np.percentile(ystack, avg_ylim_clip[1])
+            if lo == hi:
+                pad = 0.05 * (abs(hi) + 1.0)
+                lo, hi = hi - pad, hi + pad
+            # small margin
+            margin = 0.05 * (hi - lo if hi > lo else 1.0)
+            ax2.set_ylim(lo - margin, hi + margin)
+
+        fig2.tight_layout()
+        out_path2 = os.path.join(out_dir, avg_only_pdf)
+        fig2.savefig(out_path2, dpi=600, format="pdf", bbox_inches="tight")
+        plt.close(fig2)
+        print(f"[PLOT] System AoI (averages-only) saved → {out_path2}")
+
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_GTH2"
+    name = f"AoI_U{M_total}_S{num_slots}_BMX0.005"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
@@ -1420,7 +1621,7 @@ num_slots          = 8
 frames_per_episode = 1000
 num_episodes       = 30
 M_total            = 18
-
+gamma_th_db = 0
 # if you used a manual seed somewhere, define it here once
 seed = 42
 seed_value = globals().get("seed", None)
@@ -1444,7 +1645,7 @@ RUN_DIR = make_run_dir(M_total, num_slots)
 #with open(os.path.join(RUN_DIR, "meta.json"), "w") as f:
  #   json.dump(run_meta, f, indent=2)
 
-print(f"[SAVE] Run dir created: {RUN_DIR}")
+print(f"[SAVE] Run dir accessed: {RUN_DIR}")
 
 
 data = load_episode_telemetry(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
@@ -1485,19 +1686,35 @@ plot_policy_analytics_modern(
 )
 
 
-plot_system_avg_aoi_timewise_strict(
-    data=data,
-    num_slots=num_slots,
-    frames_per_episode=frames_per_episode,
-    num_episodes=num_episodes,
-    out_dir=RUN_DIR,
-    out_pdf="system_aoi_time_avg.pdf",
-    also_plot_mean_of_user_mavgs=True,
-    rolling_window=1,   # optional
-)
+#plot_system_avg_aoi_timewise_strict(
+ #   data=data,
+  #  num_slots=num_slots,
+   # frames_per_episode=frames_per_episode,
+   # num_episodes=num_episodes,
+   # out_dir=RUN_DIR,
+   # out_pdf="system_aoi_time_avg.pdf",
+   # also_plot_mean_of_user_mavgs=True,
+   # rolling_window=1,   # optional
+#)
 
 
 #plot_system_avg_aoi_timewise(data, num_slots, frames_per_episode, RUN_DIR, out_pdf="system_aoi_time.pdf")
 
 #plot_all_users_aoi(telemetry, num_slots, frames_per_episode,  out_pdf="AOI_All_Users.pdf", out_dir=RUN_DIR)
 #plot_all_users_energy(telemetry, num_slots, frames_per_episode, out_pdf="Energy_All_Users.pdf", out_dir=RUN_DIR)
+
+
+plot_system_avg_aoi_timewise_strict(
+    data,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    RUN_DIR,
+    out_pdf="system_aoi_time_avg.pdf",
+    also_plot_mean_of_user_mavgs=False,
+    rolling_window=1,                # e.g., 1000 for a smoother auxiliary curve
+    include_per_slot_in_main=False,      # True -> keep thin per-slot mean in the main figure
+    save_avg_only=True,                 # True -> also save a second "averages-only" figure
+    avg_only_pdf="system_aoi_time_avg_only.pdf",
+    avg_ylim_clip=(1, 99),              # y-axis clips by percentiles of average curves for better scale
+)
