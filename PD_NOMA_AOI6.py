@@ -15,34 +15,7 @@ import torch.nn.functional as F
 
 EPS = 1e-8
 
-class PPOActorCritic(nn.Module):
-    def __init__(self, state_dim, n_slots):
-        super().__init__()
-        self.n_slots = n_slots
-        self.f1 = nn.Linear(state_dim, 128)
-        self.f2 = nn.Linear(128, 128)
-        self.pi = nn.Linear(128, n_slots)
-        self.v = nn.Linear(128, 1)
 
-    def forward(self, states):
-        x = F.relu(self.f1(states))
-        x = F.relu(self.f2(x))
-        logits = self.pi(x)
-        value = self.v(x).squeeze(-1)
-        return logits, value
-
-    @torch.no_grad()
-    def act(self, state, slot_mask, greedy=False):
-        logits, value = self.forward(state)
-        probs = torch.softmax(logits + EPS, dim=-1) * slot_mask
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        dist = Categorical(probs)
-        if greedy:
-            a = torch.argmax(probs, dim=-1)
-        else:
-            a = dist.sample()
-        logp = dist.log_prob(a)
-        return a, logp, value, probs
 
 
 
@@ -107,12 +80,12 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 7
-frames_per_episode = 1000
-num_episodes       = 30
-M_total            = 16
+num_slots          = 3
+frames_per_episode = 2500
+num_episodes       = 100
+M_total            = 10
 K_clusters         = 3
-KF_clusters        = 4
+KF_clusters        = 6
 K_r_user           = 12.0
 alpha_c            = 0.25
 beta_c             = 1.0
@@ -124,21 +97,21 @@ gamma_th_db        = 0
 gamma_th           = 10 ** (gamma_th_db / 10.0)
 v_L                = 0.5
 v_H                = gamma_th * (1.0 + v_L)
-drop_prob          = 0.6
+drop_prob          = 0.4
 D                  = 8.0
 tau                = D / np.sqrt(2.0)  # near/far threshold by your spec
-battery_max = 2
+battery_max = 1
 
 # ------------------- PPO params (plottable & stable) -------------------
 state_dim    = 12        # [A_near, A_far, dA_near, dA_far, success_near, success_far]
-lr           = 1e-2     # stable default
-ppo_epochs   = 2
-batch_size_I   = 200
+lr           = 0.006    # stable default
+ppo_epochs   = 6
+batch_size_I   = 700
 gamma_I        = 0.99
 lam_I          = 0.9
-clip_range_I   = 0.1
+clip_range_I   = 0.3
 ent_coef_I     = 0.01
-vf_coef_I      = 0.5
+vf_coef_I      = 0.2
 max_grad_norm_I= 0.1
 epsilon = 0.5
 
@@ -156,9 +129,9 @@ EVAL_EPISODES  = 30      # (used later if you run a frozen-policy eval)
 #### _________________ Greedy Actions________ ####
 
 # set once before training
-epsilon_start = 0.25   # 20% random at the beginning
-epsilon_final = 0.005   # floor
-decay_steps   = 500000 # decisions/frames to reach the floor (tune as you like)
+epsilon_start = 0.05   # 20% random at the beginning
+epsilon_final = 0.0005   # floor
+decay_steps   = 10000 # decisions/frames to reach the floor (tune as you like)
 global_step = 0  # increment this once per decision (or per slot), not per episode
 
 import os, datetime, numpy as np
@@ -170,7 +143,7 @@ def save_run_settings(
     alpha_c, beta_c, delta_wet, delta_wit, P_HAP, noise_pow,
     gamma_th_db, v_L, drop_prob, D, tau,
     state_dim, lr, ppo_epochs, batch_size_I, gamma_I, lam_I,
-    clip_range_I, ent_coef_I, vf_coef_I, max_grad_norm_I, epsilon,
+    clip_range_I, ent_coef_I, vf_coef_I, max_grad_norm_I,
     EPS, PI_TARGET, PI_TOL, PI_PATIENCE, SAVE_NAME, EVAL_EPISODES,
     epsilon_start, epsilon_final, decay_steps, global_step, max_battery=battery_max
 ):
@@ -223,7 +196,6 @@ def save_run_settings(
         f.write(f"ent_coef_I         = {ent_coef_I}\n")
         f.write(f"vf_coef_I          = {vf_coef_I}\n")
         f.write(f"max_grad_norm_I    = {max_grad_norm_I}\n")
-        f.write(f"epsilon            = {epsilon}\n")
         f.write(f"EPS                = {EPS}\n\n")
 
         f.write("# ---- Early Stop Configuration ----\n")
@@ -250,11 +222,8 @@ def epsilon_schedule(step):
     return epsilon_final + (epsilon_start - epsilon_final) * frac
 # ------------------- Utility -------------------
 def masked_softmax(logits, mask, dim=-1):
-    """Numerically-stable masked softmax: mask 1=valid, 0=invalid."""
-    mask = mask.to(logits.dtype)
-    neg_inf = torch.finfo(logits.dtype).min
-    masked = logits + (mask + EPS).log()  # add log(mask) ~ 0 or -inf
-    # Alternatively: masked = logits.masked_fill(mask < 0.5, neg_inf)
+    very_neg = torch.finfo(logits.dtype).min
+    masked = logits.masked_fill(mask < 0.5, very_neg)
     return torch.softmax(masked, dim=dim)
 
 def rician_power(K_r):
@@ -268,6 +237,33 @@ def rician_power(K_r):
 def sepl_gain(d, alpha_c, beta_c):
     """SEPL large-scale power gain: exp(-alpha_c * d^beta_c)."""
     return math.exp(-alpha_c * (d ** beta_c))
+
+def delete_temp_files(mm_dir):
+    """
+    Delete all .dat temporary files in the mm_dir folder.
+    """
+    try:
+        # Get all .dat files in the mm directory
+        temp_files = [f for f in os.listdir(mm_dir) if f.endswith('.dat')]
+
+        # Delete each .dat file
+        for temp_file in temp_files:
+            file_path = os.path.join(mm_dir, temp_file)
+            try:
+                os.remove(file_path)
+                print(f"[DELETE] Deleted temporary file: {file_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to delete file {file_path}: {e}")
+
+        # Optionally, remove the mm directory if it is empty
+        try:
+            os.rmdir(mm_dir)
+            print(f"[DELETE] Deleted mm directory: {mm_dir}")
+        except Exception as e:
+            print(f"[ERROR] Failed to remove directory {mm_dir}: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to delete temporary files: {e}")
 
 # ------------------- User state -------------------
 class UserState:
@@ -299,10 +295,10 @@ class UserState:
         self.belief_energy = 0.0
         self.energy_per_slot = energy_per_slot
 
-        self.scheduled_count = 0
-        self.success_count = 0
-        self.belief_psuccess = 0.5  # initial belief
-
+        #self.scheduled_count = 0
+        #self.success_count = 0
+        #self.belief_psuccess = 0.5  # initial belief
+        self.slot_add_schedule = 0
         self.scheduled_count = 0
         self.success_count = 0
         self.belief_psuccess = 0.5  # initial belief
@@ -375,7 +371,7 @@ class UserState:
 
 
 # ------------------- Inter-cell interference (cross-link only) -------------------
-def intercell_interference(K_clusters, alpha_c, beta_c, v_H, v_L, d_cross_rng=(40.0, 60.0), K_r_cross=KF_clusters):
+def intercell_interference(K_clusters, alpha_c, beta_c, v_H, v_L, d_cross_rng=(10.0, 16.0), K_r_cross=KF_clusters):
     """
     Sum of power from (K_clusters-1) other clusters, each with one high & one low user.
     We compute received power at our HAP using SEPL(d_cross)*|h|^2 multiplied by that user's
@@ -673,9 +669,108 @@ def compute_gae(rewards, values, dones, gamma=gamma_I, lam=lam_I):
     returns = adv + values
     return adv, returns
 
+
+def ppo_update(policy, buffer, optimizer,
+               epochs=ppo_epochs, batch_size=batch_size_I,
+               clip_range=clip_range_I, ent_coef=ent_coef_I, vf_coef=vf_coef_I, max_grad_norm=max_grad_norm_I,
+               gamma=gamma_I, lam=lam_I):
+    policy.train()
+    T = len(buffer)
+    if T == 0:
+        return dict(pi_loss=0.0, v_loss=0.0, ent=0.0, kl=0.0, return_list=[])
+
+    mean_reward = buffer.rewards[:T].mean().item()  # or use running average
+    std_reward = buffer.rewards[:T].std().item()  # or use running std
+    normalized_rewards = (buffer.rewards[:T] - mean_reward) / (std_reward + 1e-8)
+
+    advantages, returns = compute_gae(normalized_rewards, buffer.values[:T], buffer.dones[:T],
+                                      gamma=gamma, lam=lam)
+    # normalize advantages
+    adv_std = advantages.std().clamp_min(1e-6)
+    advantages = (advantages - advantages.mean()) / adv_std
+
+    idxs = torch.arange(T, device=device)
+    pi_losses = []
+    v_losses = []
+    ents = []
+    kls = []
+    return_list = []  # Track the returns for plotting
+
+    for _ in range(epochs):
+        perm = idxs[torch.randperm(T)]
+        for start in range(0, T, batch_size):
+            mb = perm[start:start+batch_size]
+            s = buffer.states[mb]
+            msk = buffer.masks[mb]
+            a = buffer.actions[mb]
+            old_logp = buffer.logps[mb]
+            ret = returns[mb]
+            adv = advantages[mb]
+
+            logits, v = policy(s)
+            probs = masked_softmax(logits, msk, dim=-1).clamp_min(EPS)
+            dist = Categorical(probs)
+            logp = dist.log_prob(a)
+            entropy = dist.entropy().mean()
+
+            # ratio
+            ratio = (logp - old_logp).exp().clamp(0.0, 10.0)
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * adv
+            pi_loss = -torch.min(surr1, surr2).mean()
+
+            v_loss = F.mse_loss(v, ret)
+
+            loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            optimizer.step()
+
+            with torch.no_grad():
+                kl = (old_logp - logp).mean().clamp_min(0.0)
+
+            pi_losses.append(pi_loss.item())
+            v_losses.append(v_loss.item())
+            ents.append(entropy.item())
+            kls.append(kl.item())
+
+        # Track the total return (based on the GAE calculation, not the sum of rewards)
+        total_return = returns.sum().item()  # Use the actual return from GAE
+        return_list.append(total_return)
+
+    return dict(
+        pi_loss=float(np.mean(pi_losses) if pi_losses else 0.0),
+        v_loss=float(np.mean(v_losses) if v_losses else 0.0),
+        ent=float(np.mean(ents) if ents else 0.0),
+        kl=float(np.mean(kls) if kls else 0.0),
+        return_list=return_list
+    )
+
+
+def plot_returns(returns, out_dir, filename="ppo_returns.pdf"):
+    """
+    Plots and saves the training returns over episodes.
+    """
+    plt.figure(figsize=(8, 6))
+    plt.plot(returns, label="Episode Returns")
+    plt.xlabel("Episodes")
+    plt.ylabel("Returns")
+    plt.title("PPO Training Returns")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    out_path = os.path.join(out_dir, filename)
+    plt.savefig(out_path, dpi=600, format="pdf")
+    plt.close()
+    print(f"[PLOT] Returns saved to {out_path}")
+
+''''''''''
 def ppo_update(policy, buffer, optimizer,
                epochs = ppo_epochs, batch_size=batch_size_I,
-               clip_range=clip_range_I, ent_coef=ent_coef_I, vf_coef=ent_coef_I, max_grad_norm=max_grad_norm_I,
+               clip_range=clip_range_I, ent_coef=ent_coef_I, vf_coef=vf_coef_I, max_grad_norm=max_grad_norm_I,
                gamma=gamma_I, lam=lam_I):
     policy.train()
     T = len(buffer)
@@ -736,13 +831,14 @@ def ppo_update(policy, buffer, optimizer,
             ents.append(entropy.item())
             kls.append(kl.item())
 
-    return dict(
-        pi_loss=float(np.mean(pi_losses) if pi_losses else 0.0),
-        v_loss=float(np.mean(v_losses) if v_losses else 0.0),
-        ent=float(np.mean(ents) if ents else 0.0),
-        kl=float(np.mean(kls) if kls else 0.0),
-    )
+    #return dict(
+    #    pi_loss=float(np.mean(pi_losses) if pi_losses else 0.0),
+    #    v_loss=float(np.mean(v_losses) if v_losses else 0.0),
+    #    ent=float(np.mean(ents) if ents else 0.0),
+    #    kl=float(np.mean(kls) if kls else 0.0),
+    #)
 
+'''''
 @torch.no_grad()
 def assign_slots_ppo(policy, device, users, num_slots, build_pair_state, candidate_pairs):
     """
@@ -788,7 +884,7 @@ def build_pair_state(uN, uF):
 
     A_n, A_f = _safe(uN.aoi, 0, 1e6), _safe(uF.aoi, 0, 1e6)
     dA_n, dA_f = _safe(uN.delta_aoi_prev, -1e6, 1e6), _safe(uF.delta_aoi_prev, -1e6, 1e6)
-    dec_n, dec_f = _safe(uN.last_decoded_slot, 0, 1e6), _safe(uF.last_decoded_slot, 0, 1e6)
+    dec_n, dec_f = _safe(uN.slot_add_schedule, 0, 1e6), _safe(uF.slot_add_schedule, 0, 1e6)
     dist_n, dist_f = _safe(uN.d, 0, 1e6), _safe(uF.d, 0, 1e6)
     belief_e_n, belief_e_f = _safe(uN.belief_energy, 0, 1e6), _safe(uF.belief_energy, 0, 1e6)
     psucc_n, psucc_f = _safe(uN.belief_psuccess, 0, 1), _safe(uF.belief_psuccess, 0, 1)
@@ -799,13 +895,13 @@ def build_pair_state(uN, uF):
     ], dtype=np.float32)
 
     # last line of defense:
-    s = np.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
+    #s = np.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
     return s
 
 
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_SLT"
+    name = f"AoI_U{M_total}_S{num_slots}_LR3e32"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
@@ -1006,6 +1102,8 @@ class Telemetry:
             "sinr": float(sinr) if sinr is not None else 0.0,
             "distance": float(distance) if distance is not None else 0.0,
         }
+        if uid_num not in self.by_uid:
+            self.by_uid[uid_num] = []
         self.by_uid[uid_num].append(row)
 
     def flush_episode_to_temp_file(self, ep):
@@ -1022,11 +1120,13 @@ class Telemetry:
 
         # Write the current episode's data into the memory-mapped file
         with open(episode_filename, "wb") as f:
-            np.save(f, dict(self.by_uid))  # Save the by_uid data to the temporary file
+            # Save the by_uid data for this episode only
+            episode_data = {uid: self.by_uid[uid] for uid in self.by_uid}  # Create a shallow copy for the episode
+            np.save(f, episode_data)  # Save the data to the temporary file
 
         # After saving, clear memory for the next episode
-        self.by_uid.clear()
-        gc.collect()
+        self.by_uid.clear()  # This ensures that previous episode data is not saved in the next one
+        gc.collect()  # Collect garbage to free memory
 
         print(f"[FLUSH] Episode {ep} data saved to temporary memory file at {episode_filename}.")
 
@@ -1041,7 +1141,7 @@ class Telemetry:
         merged = defaultdict(list)
 
         # Merge data from all episodes
-        for ep in range(self.num_episodes):
+        for ep in range(1, self.num_episodes+1):
             episode_filename = os.path.join(self.mm_dir,
                                             f"temp_slotwise_data_ep{ep:04d}_U{self.M_total}S{self.num_slots}.dat")
             try:
@@ -1941,7 +2041,7 @@ settings_file = save_run_settings(
     batch_size_I=batch_size_I, gamma_I=gamma_I, lam_I=lam_I,
     clip_range_I=clip_range_I, ent_coef_I=ent_coef_I,
     vf_coef_I=vf_coef_I, max_grad_norm_I=max_grad_norm_I,
-    epsilon=epsilon, EPS=EPS,
+     EPS=EPS,
 
     # --- Early stop ---
     PI_TARGET=PI_TARGET, PI_TOL=PI_TOL, PI_PATIENCE=PI_PATIENCE,
@@ -1971,15 +2071,30 @@ recorder = None
 #users = [UserState(f"U{i+1}", d_init=np.random.uniform(1.0, D)) for i in range(M_total)]
 users = []
 
-# First half: near users, distance ∈ [1, D/2]
-for i in range(M_total // 2):
-    d_init = np.random.uniform(1.0, D / 2)
-    users.append(UserState(f"U{i+1}", d_init=d_init, max_bat = battery_max))
+def reset_users(M_total, D, battery_init = 0.01):
+    # First half: near users, distance ∈ [1, D/2]
+    for i in range(M_total // 2):
+        d_init = np.random.uniform(1.0, D / 2)
+        users.append(UserState(f"U{i + 1}", d_init=d_init, max_bat=battery_init))
 
-# Second half: far users, distance ∈ [D/2 + 0.1, D]
-for i in range(M_total // 2, M_total):
-    d_init = np.random.uniform(D / 2 + 0.1, D)
-    users.append(UserState(f"U{i+1}", d_init=d_init, max_bat = battery_max))
+    # Second half: far users, distance ∈ [D/2 + 0.1, D]
+    for i in range(M_total // 2, M_total):
+        d_init = np.random.uniform(D / 2 + 0.1, D)
+        users.append(UserState(f"U{i + 1}", d_init=d_init, max_bat=battery_init))
+    # initial channel sample & AoI
+    for i, u in enumerate(users):
+        u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
+        u.aoi = 1
+        u.aoi_prev = 1
+        u.aoi_sum = 0.0
+        u.aoi_count = 0
+        u.decode = 0
+        u.succ_ema = 0.5
+        u.last_decoded = 0
+        u.last_slot_used = None
+        u.assigned_this_frame = False
+        # u.battery = 0.1
+        # aoi_users[i, 0] = u.aoi
 
 stop_counter = 0
 stopped_at_ep = None
@@ -1995,42 +2110,37 @@ Run_mode = "ppo"  # "ppo" | "greedy" | "random" | "threshold"
 EP_Reward_sum = []
 decision_timeline = []  # global list[DecisionLog]
 
-
-# initial channel sample & AoI
-for i, u in enumerate(users):
-    u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
-    # u.aoi = 1
-    # u.aoi_prev = 1
-    # u.aoi_sum = 0.0
-    # u.aoi_count = 0
-    u.decode = 0
-    u.succ_ema = 0.5
-    u.last_decoded = 0
-    u.last_slot_used = None
-    u.assigned_this_frame = False
-    # u.battery = 0.1
-    # aoi_users[i, 0] = u.aoi
+reset_users(M_total, D, battery_init=0.015)
 
 # initial grouping
 near_all, far_all = split_groups_by_distance(users, tau)
 allowed_near, idle_near, allowed_far, idle_far = init_allowed_idle(near_all, far_all, num_slots)
 #telemetry = new_buffer()  # episode buffer
 telemetry = Telemetry(RUN_DIR, M_total, num_slots, num_episodes)
+returns_all_episodes = []
 
 for ep in range(1, num_episodes + 1):
 
     for i, u in enumerate(users):
+        u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
+
+
+    # initial grouping
+    near_all, far_all = split_groups_by_distance(users, tau)
+    allowed_near, idle_near, allowed_far, idle_far = init_allowed_idle(near_all, far_all, num_slots)
+
+    #for i, u in enumerate(users):
         #u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
-        # u.aoi = 1
-        # u.aoi_prev = 1
-        # u.aoi_sum = 0.0
-        # u.aoi_count = 0
-        u.decode = 0
-        u.succ_ema = 0.5
-        u.last_decoded = 0
-        u.last_slot_used = None
-        u.assigned_this_frame = False
-        # u.battery = 0.1
+        #u.aoi = 1
+        #u.aoi_prev = 1
+        #u.aoi_sum = 0.0
+        #u.aoi_count = 0
+     #   u.decode = 0
+      #  u.succ_ema = 0.5
+      #  u.last_decoded = 0
+      #  u.last_slot_used = None
+      #  u.assigned_this_frame = False
+        #u.battery = 0.001
         # aoi_users[i, 0] = u.aoi
 
 
@@ -2084,12 +2194,15 @@ for ep in range(1, num_episodes + 1):
                 u.aoi += 1
                 #u.decode = 0
                 u.last_decoded_slot += 1
+                u.slot_add_schedule += 1
             scheduled = {}
             if sl in slot_map:
                 entry = slot_map[sl]
                 if entry.__class__ is tuple and len(entry) == 2 and isinstance(entry[0], UserState):
                     # ("pair", (uN,uF), s)
                     uN, uF = entry
+                    uN.slot_add_schedule = 0
+                    uF.slot_add_schedule = 0
                     dec_H, dec_L, sinr_H, sinr_L, battH, battL, reqH, reqL = decode_pair_pd_noma(
                         uN, uF, v_H, v_L, gamma_th, noise_pow, K_clusters,
                         alpha_c, beta_c, delta_wet, delta_wit, P_HAP
@@ -2111,7 +2224,7 @@ for ep in range(1, num_episodes + 1):
                         uF.decode = 0
                     #r_pair = -(uN.aoi + uF.aoi)
                     #rewards = r_pair
-                    r_t = - (uN.aoi  + uF.aoi) #(sum(u.aoi for u in users) )  # negative mean AoI over all users
+                    r_t = - (uN.aoi  + uF.aoi) - sl #(sum(u.aoi for u in users) )  # negative mean AoI over all users
                     # example: reward = some_reward_value
                     sar_logger.set_reward(ep, frame, sl, r_t)
                     #reward_timeline.append(float(r_t))
@@ -2126,15 +2239,25 @@ for ep in range(1, num_episodes + 1):
 
                     k = idx_by_slot.get(sl, 0)
                     if k is not None:
-                        buffer.add(
+                        if sl == num_slots-1 and frame == frames_per_episode -1:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                1  # not done within the frame
+                            )
+                        else:
+                            buffer.add(
                             states_to_buffer[k],
                             masks_to_buffer[k],
                             torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
                             logps_to_buffer[k],
                             values_to_buffer[k],
                             r_t,  # scalar float is fine for most buffers
-                            0.0  # not done within the frame
-                        )
+                            0.0 ) # not done within the frame
                     # pair (NOMA)
                     scheduled[uN.uid] = dict(kind="NOMA-H", sinr=sinr_H, battery=battH,
                                              harvested=uN.harvested, required=reqH, decoded=int(dec_H),
@@ -2155,6 +2278,7 @@ for ep in range(1, num_episodes + 1):
                     # ("single", u, s)
                     entry = slot_map[sl]
                     u_single = entry
+                    u_single.slot_add_schedule = 0
                     dec, sinr, batt, req = decode_single_oma(u_single, v_H, gamma_th, noise_pow, K_clusters, alpha_c, beta_c, delta_wet, delta_wit, P_HAP)
 
                     if dec:
@@ -2166,7 +2290,7 @@ for ep in range(1, num_episodes + 1):
                         u_single.decode = 0
                     #r_single = -u_single.aoi
                     #rewards = r_single
-                    r_t = - u_single.aoi # (sum(u.aoi for u in users) )  # negative mean AoI over all users
+                    r_t = - u_single.aoi -sl # (sum(u.aoi for u in users) )  # negative mean AoI over all users
                     sar_logger.set_reward(ep, frame, sl, r_t)
                     #reward_timeline.append(float(r_t))
                     frame_reward_sum += float(r_t)
@@ -2178,15 +2302,26 @@ for ep in range(1, num_episodes + 1):
 
                     k = idx_by_slot.get(sl, 0)
                     if k is not None:
-                        buffer.add(
-                            states_to_buffer[k],
-                            masks_to_buffer[k],
-                            torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
-                            logps_to_buffer[k],
-                            values_to_buffer[k],
-                            r_t,  # scalar float is fine for most buffers
-                            0.0  # not done within the frame
-                        )
+                        if sl == num_slots-1 and frame == frames_per_episode -1:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                1  # not done within the frame
+                            )
+                        else:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                0.0  # not done within the frame
+                            )
 
 
                     scheduled[u_single.uid] = dict(kind="OMA", sinr=sinr, battery=batt,
@@ -2257,12 +2392,18 @@ for ep in range(1, num_episodes + 1):
                                                                                    idle_far, tau)
 
     system_avg = compute_average_aoi(telemetry, num_slots, frames_per_episode, RUN_DIR)
-    print(f"[Episode {ep + 1}] System Avg AoI: {system_avg:.3f}")
+    print(f"[Episode {ep}] System Avg AoI: {system_avg:.3f}")
 
     if ep % 1 == 0 or ep == 1:
         print(f"Ep {ep:4d}/{num_episodes}" ) #| AvgAoI={aoi_avg_ep[-1]:6.3f} | "
               #f"π_loss={stats['pi_loss']:.4f} | V_loss={stats['v_loss']:.4f} | "
               #f"Ent={stats['ent']:.4f} | KL={stats['kl']:.4f}")
+
+        # Perform PPO update
+    update_info = ppo_update(policy, buffer, optimizer)
+    returns_all_episodes.extend(update_info["return_list"])
+    if ep % 10 == 0:
+        plot_returns(returns_all_episodes, RUN_DIR, filename=f"ppo_returns_up_to_ep{ep}.pdf")
     #telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
     #telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
         # After logging, flush data for the episode:
@@ -2275,6 +2416,7 @@ for ep in range(1, num_episodes + 1):
 per_user_moving = compute_moving_avg_aoi_per_user(telemetry)
 user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(telemetry, num_slots)
 user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(telemetry)
+plot_returns(returns_all_episodes, RUN_DIR, filename="ppo_returns_final.pdf")
 
 sar_logger.save(RUN_DIR, filename=f"sar_logU{M_total}S{num_slots}.pkl")
 
@@ -2285,15 +2427,15 @@ for ep, avg in system_ep_aoi.items():
 
 data = load_episode_telemetry(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
 #plot_all_users_avg_aoi_combined(data, num_slots=num_slots, frames_per_episode=frames_per_episode, num_episodes = num_episodes ,out_dir="AoI_U6_S2_PPNR")
-plot_moving_avg_aoi_per_user(
-    data=data,
-    num_slots=num_slots,
-    frames_per_episode=frames_per_episode,
-    num_episodes=num_episodes,
-    out_dir=RUN_DIR,
-    out_pdf="All_Users_MovingAvgAoICluster2.pdf",
-    episode_tick=5
-)
+#plot_moving_avg_aoi_per_user(
+#    data=data,
+ #   num_slots=num_slots,
+ #   frames_per_episode=frames_per_episode,
+ #   num_episodes=num_episodes,
+  #  out_dir=RUN_DIR,
+  #  out_pdf="All_Users_MovingAvgAoICluster2.pdf",
+  #  episode_tick=5
+#)
 plot_system_avg_aoi(data, num_slots=num_slots, frames_per_episode=frames_per_episode,  out_dir=RUN_DIR, out_pdf="system_avg_aoicluster2.pdf")
 
 #plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=10)
@@ -2302,3 +2444,6 @@ plot_time_averaged_system_aoi(data, num_slots, frames_per_episode, RUN_DIR, out_
 
 #plot_all_users_aoi(telemetry, num_slots, frames_per_episode,  out_pdf="AOI_All_Users.pdf", out_dir=RUN_DIR)
 #plot_all_users_energy(telemetry, num_slots, frames_per_episode, out_pdf="Energy_All_Users.pdf", out_dir=RUN_DIR)
+
+
+delete_temp_files(os.path.join(RUN_DIR, "mm"))
