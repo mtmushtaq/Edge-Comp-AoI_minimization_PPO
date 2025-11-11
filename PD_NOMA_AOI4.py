@@ -108,10 +108,10 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 7
-frames_per_episode = 1000
-num_episodes       = 30
-M_total            = 23
+num_slots          = 2
+frames_per_episode = 100
+num_episodes       = 3
+M_total            = 5
 K_clusters         = 3
 KF_clusters        = 4
 K_r_user           = 12.0
@@ -1104,7 +1104,7 @@ class Telemetry:
 
     def flush_episode_to_temp_file(self, ep, M_total, num_slots):
         """
-        Save episode data into a temporary memory file and clear by_uid.
+        Save episode data into a temporary memory file and clear the by_uid.
         """
         if not self.by_uid:
             return
@@ -1113,11 +1113,16 @@ class Telemetry:
         self.AAOI_ep_mm[ep - 1] = self.compute_system_aoi(num_slots)
 
         # Optionally, save slot-wise data if needed, similar to `self.AAOI_ep_mm`
+        for uid_num, rows in self.by_uid.items():
+            # Save the slotwise data
+            slotwise_data_path = os.path.join(self.mm_dir, f"slotwise_data_ep{ep}_uid{uid_num}.dat")
+            with open(slotwise_data_path, "wb") as f:
+                pickle.dump(rows, f)
 
         # After saving, clear memory for the next episode
         self.by_uid.clear()
         gc.collect()
-        #print(f"[FLUSH] Episode {ep} data saved to temporary memory file.")
+        print(f"[FLUSH] Episode {ep} data saved to temporary memory file.")
 
     def finalize_run(self, run_dir, M_total, num_slots, final_filename="slotwise_dataU{M_total}S{num_slots}.npy",
                      keep_chunks=True):
@@ -1145,45 +1150,17 @@ class Telemetry:
         np.save(final_path, dict(merged), allow_pickle=True)
         print(f"[FINAL] Data merged and saved to {final_path}")
 
-    # ------------- Final assembly (write the SAME final file your plots expect) -------------
-    def finalize_run(self, run_dir, M_total, num_slots,
-                     final_filename=None, keep_chunks=True):
-        """
-        Merge all chunks (+ leftovers in RAM) into:
-            slotwise_dataU{M_total}S{num_slots}.npy
-        Structure: dict[uid:int] -> list[row_dict]
-        """
-        if final_filename is None:
-            final_filename = f"slotwise_dataU{M_total}S{num_slots}.npy"
-        final_path = os.path.join(run_dir, final_filename)
-
-        merged = defaultdict(list)
-        chunks_dir = os.path.join(run_dir, "chunks")
-        pattern = os.path.join(chunks_dir, f"slotwise_data_ep*_U{M_total}S{num_slots}.npy")
-        chunk_paths = sorted(glob.glob(pattern))
-
-        for cp in chunk_paths:
+        # Optionally remove the chunk files
+        if not keep_chunks and chunk_files:
+            for chunk_file in chunk_files:
+                try:
+                    os.remove(chunk_file)
+                except Exception:
+                    pass
             try:
-                d = np.load(cp, allow_pickle=True).item()
-                for k, v in d.items():
-                    merged[int(k)].extend(v)
-            except Exception as e:
-                print(f"[WARN] failed to read chunk {cp}: {e}")
-
-        if self.by_uid:
-            for k, v in self.by_uid.items():
-                merged[int(k)].extend(v)
-            self.by_uid.clear()
-
-        self._atomic_save_dict(final_path, dict(merged))
-        print(f"[FINAL] wrote {final_path}  (uids={len(merged)})")
-
-        if not keep_chunks and chunk_paths:
-            for cp in chunk_paths:
-                try: os.remove(cp)
-                except Exception: pass
-            try: os.rmdir(chunks_dir)
-            except Exception: pass
+                os.rmdir(chunks_dir)
+            except Exception:
+                pass
 
     # ------------- Legacy save methods (both write same structure) -------------
     def save_episode_npy(self, run_dir, filename="episode_data.npy"):
@@ -2327,7 +2304,7 @@ for ep in range(1, num_episodes + 1):
                                        distance=uF.d,
                                        scheduled=1, pd_role="NOMA-L")
                     # Flush data for the current episode
-                    telemetry.flush_episode_to_temp_file(ep, M_total, num_slots)
+
 
                 else:
                     # ("single", u, s)
@@ -2375,7 +2352,7 @@ for ep in range(1, num_episodes + 1):
                                        decoded=u_single.decode, aoi=u_single.aoi,
                                        distance=u_single.d, scheduled=1, pd_role="OMA")
                     # Flush data for the current episode
-                    telemetry.flush_episode_to_temp_file(ep, M_total, num_slots)
+                    #telemetry.flush_episode_to_temp_file(ep, M_total, num_slots)
 
                 global_step += 1
                 # Fetch the right transition by slot -> index
@@ -2443,6 +2420,7 @@ for ep in range(1, num_episodes + 1):
         print(f"Ep {ep:4d}/{num_episodes}" ) #| AvgAoI={aoi_avg_ep[-1]:6.3f} | "
               #f"π_loss={stats['pi_loss']:.4f} | V_loss={stats['v_loss']:.4f} | "
               #f"Ent={stats['ent']:.4f} | KL={stats['kl']:.4f}")
+    telemetry.flush_episode_to_temp_file(ep, M_total, num_slots)
     #telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
     #telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
 

@@ -58,68 +58,6 @@ class PPOActorCritic(nn.Module):
 # - per-user average AoI, system AoI tracking
 # - plotting integrat
 
-class Telemetry:
-    def __init__(self):
-        from collections import defaultdict
-        self.by_uid = defaultdict(list)
-        self._tick = 0
-
-    def tick(self):
-        self._tick += 1
-        return self._tick
-
-    def _parse_uid(self, u):
-        if hasattr(u, "uid"): raw = u.uid
-        else: raw = u
-        if isinstance(raw, int): return int(raw), f"U{int(raw)}"
-        if isinstance(raw, str):
-            import re
-            m = re.search(r"\\d+", raw)
-            if m: n = int(m.group(0)); return n, f"U{n}"
-        raise ValueError(f"Invalid uid: {u}")
-
-    def log_user(self, ep, u, frame, slot, kind, sinr, battery,
-                 harvested, required, decoded, aoi, distance,
-                 scheduled, pd_role):
-        uid_num, uid_str = self._parse_uid(u)
-        row = {
-            "ep": int(ep), "frame": int(frame), "slot": int(slot),
-            "uid": uid_num, "uid_str": uid_str, "step": self.tick(),
-            "kind": kind, "pd_role": pd_role,
-            "scheduled": int(bool(scheduled)), "decoded": int(bool(decoded)),
-            "required": int(bool(required)), "aoi": float(aoi),
-            "battery": float(battery), "harvested": float(harvested),
-            "sinr": float(sinr), "distance": float(distance)
-        }
-        self.by_uid[uid_num].append(row)
-
-    def clear_frame(self, ep, frame):
-        removed = 0
-        for uid in list(self.by_uid.keys()):
-            rows = self.by_uid[uid]
-            keep = [r for r in rows if not (r["ep"] == ep and r["frame"] == frame)]
-            removed += len(rows) - len(keep)
-            self.by_uid[uid] = keep if keep else self.by_uid.pop(uid)
-        return removed
-
-    def save_episode_npy(self, path="telemetry_episode.npy"):
-        data = dict(self.by_uid)
-        np.save(path, data)
-
-    def save_slotwise_dat(self, path="slotwise.dat"):
-        with open(path, "wb") as f:
-            pickle.dump(dict(self.by_uid), f)
-
-    def compute_average_aoi(self, total_slots):
-        uid_avg = {}
-        for uid, rows in self.by_uid.items():
-            aoi_sum = sum(r["aoi"] for r in rows)
-            uid_avg[uid] = aoi_sum / total_slots
-        return uid_avg
-
-    def compute_system_aoi(self, total_slots):
-        user_avgs = self.compute_average_aoi(total_slots)
-        return sum(user_avgs.values()) / len(user_avgs)
 
 # PPOAgent, assign_slots_for_frame, plot_all_users_aoi(), and plot_all_users_energy()
 # would also be included from your finalized PPO policy and visual functions.
@@ -152,7 +90,7 @@ import matplotlib as mpl
 import os
 import os, json, numpy as np
 from datetime import datetime
-#from telemetry_flush import new_buffer, append_slot, flush_episode, finalize_run_and_write_final
+from telemetry_flush import new_buffer, append_slot, flush_episode, finalize_run_and_write_final
 
 #from AOI_PPO_PDNOMA import num_frames, num_users
 
@@ -168,10 +106,10 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 7
+num_slots          = 1
 frames_per_episode = 1000
-num_episodes       = 30
-M_total            = 19
+num_episodes       = 15
+M_total            = 8
 K_clusters         = 1
 KF_clusters        = 4
 K_r_user           = 12.0
@@ -985,12 +923,27 @@ class PPOActorCritic(nn.Module):
         return a, logp, value, probs
 
 
+# telemetry_unified.py
+import os, re, gc, glob, csv, pickle, tempfile
+import numpy as np
+from collections import defaultdict
+
 class Telemetry:
+    """
+    Unified telemetry logger with episode-wise flushing.
+    Data shape (in RAM and on disk):
+        by_uid: dict[int uid] -> list[ row_dict ]
+    Row keys (exactly as requested):
+        'ep','frame','slot','uid','uid_str','step','kind','pd_role',
+        'scheduled','decoded','required','aoi','battery','harvested','sinr','distance'
+    """
+
     def __init__(self):
         self.by_uid = defaultdict(list)
         self._tick = 0
+        self._frame_scratch = {}
 
-    @staticmethod
+    # ------------- ID parsing & step counter -------------
     @staticmethod
     def _parse_uid(u):
         """
@@ -998,10 +951,7 @@ class Telemetry:
         or an int 32. Returns (uid_num:int, uid_str:str).
         """
         # UserState
-        if hasattr(u, "uid"):
-            raw = u.uid
-        else:
-            raw = u
+        raw = getattr(u, "uid", u)
 
         # string like 'U2' or '2'
         if isinstance(raw, str):
@@ -1009,12 +959,12 @@ class Telemetry:
             if m:
                 n = int(m.group(0))
                 return n, f"U{n}"
-            else:
-                raise ValueError(f"String uid must contain a number: {raw!r}")
+            raise ValueError(f"String uid must contain a number: {raw!r}")
 
         # integer
         if isinstance(raw, (int, np.integer)):
-            return int(raw), f"U{int(raw)}"
+            n = int(raw)
+            return n, f"U{n}"
 
         raise ValueError(f"Invalid uid: {u!r} (expected UserState/int/'U#')")
 
@@ -1022,31 +972,39 @@ class Telemetry:
         self._tick += 1
         return self._tick
 
+    # ------------- Logging (keep your current call signature) -------------
     def log_user(self, ep, u, frame, slot, kind, sinr, battery,
                  harvested, required, decoded, aoi, distance,
                  scheduled, pd_role):
+        """
+        Called from your slot loop, e.g.:
+          telemetry.log_user(ep=ep, u=uN, frame=frame, slot=sl, kind="PDNOMA",
+                             sinr=sinr_H, battery=uN.battery, harvested=uN.harvested,
+                             required=reqH, decoded=uN.decode, aoi=uN.aoi, distance=uN.d,
+                             scheduled=1, pd_role="NOMA-H")
+        """
         uid_num, uid_str = self._parse_uid(u)
         row = {
-            "ep": int(ep),
-            "frame": int(frame),
-            "slot": int(slot),
-            "uid": uid_num,
-            "uid_str": uid_str,
-            "step": self.tick(),
-            "kind": str(kind) if kind else "",
-            "pd_role": str(pd_role) if pd_role else "",
+            "ep":        int(ep),
+            "frame":     int(frame),
+            "slot":      int(slot),
+            "uid":       uid_num,
+            "uid_str":   uid_str,
+            "step":      self.tick(),
+            "kind":      (str(kind) if kind else ""),
+            "pd_role":   (str(pd_role) if pd_role else ""),
             "scheduled": int(bool(scheduled)),
-            "decoded": int(bool(decoded)),
-            "required": int(bool(required)),
-            "aoi": float(aoi) if aoi is not None else 0.0,
-            "battery": float(battery) if battery is not None else 0.0,
+            "decoded":   int(bool(decoded)),
+            "required":  int(bool(required)),
+            "aoi":       float(aoi) if aoi is not None else 0.0,
+            "battery":   float(battery) if battery is not None else 0.0,
             "harvested": float(harvested) if harvested is not None else 0.0,
-            "sinr": float(sinr) if sinr is not None else 0.0,
-            "distance": float(distance) if distance is not None else 0.0,
-
+            "sinr":      float(sinr) if sinr is not None else 0.0,
+            "distance":  float(distance) if distance is not None else 0.0,
         }
         self.by_uid[uid_num].append(row)
 
+    # ------------- Optional per-frame helpers (kept for compatibility) -------------
     def export_frame_csv(self, run_dir, ep, frame, filename="telemetry_rows.csv", warn_missing=True):
         os.makedirs(run_dir, exist_ok=True)
         path = os.path.join(run_dir, filename)
@@ -1084,7 +1042,16 @@ class Telemetry:
             print(f"[telemetry] export_frame_csv: skipped {missing_ct} malformed row(s) (ep={ep}, frame={frame}).")
         return written_ct
 
-    def clear_frame(self, ep, frame):
+    def clear_frame(self, ep=None, frame=None):
+        """
+        Compatibility: if ep & frame given, remove rows belonging to that frame.
+        If called with no args (legacy), just clear scratch (not by_uid).
+        """
+        if ep is None or frame is None:
+            # legacy behavior: do not delete logged rows
+            self._frame_scratch.clear()
+            return 0
+
         removed = 0
         for uid_num in list(self.by_uid.keys()):
             rows = self.by_uid[uid_num]
@@ -1096,58 +1063,132 @@ class Telemetry:
                 del self.by_uid[uid_num]
         return removed
 
-    from pathlib import Path
-    import numpy as np
-    from pathlib import Path
+    def clear_all(self):
+        self.by_uid.clear()
+        self._frame_scratch.clear()
+        gc.collect()
 
+    # ------------- Episode flushing to chunks -------------
+    def flush_episode(self, run_dir, M_total, num_slots, ep):
+        """
+        Save one episode chunk to:
+          {run_dir}/chunks/slotwise_data_ep{ep:04d}_U{M_total}S{num_slots}.npy
+        Then clear in-RAM buffer.
+        """
+        if not self.by_uid:
+            return
+        chunks_dir = os.path.join(run_dir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        out_path = os.path.join(
+            chunks_dir, f"slotwise_data_ep{int(ep):04d}_U{M_total}S{num_slots}.npy"
+        )
+        self._atomic_save_dict(out_path, dict(self.by_uid))
+        self.by_uid.clear()
+        gc.collect()
+        print(f"[FLUSH] episode={ep} → {out_path}")
+
+    # ------------- Final assembly (write the SAME final file your plots expect) -------------
+    def finalize_run(self, run_dir, M_total, num_slots,
+                     final_filename=None, keep_chunks=True):
+        """
+        Merge all chunks (+ leftovers in RAM) into:
+            slotwise_dataU{M_total}S{num_slots}.npy
+        Structure: dict[uid:int] -> list[row_dict]
+        """
+        if final_filename is None:
+            final_filename = f"slotwise_dataU{M_total}S{num_slots}.npy"
+        final_path = os.path.join(run_dir, final_filename)
+
+        merged = defaultdict(list)
+        chunks_dir = os.path.join(run_dir, "chunks")
+        pattern = os.path.join(chunks_dir, f"slotwise_data_ep*_U{M_total}S{num_slots}.npy")
+        chunk_paths = sorted(glob.glob(pattern))
+
+        for cp in chunk_paths:
+            try:
+                d = np.load(cp, allow_pickle=True).item()
+                for k, v in d.items():
+                    merged[int(k)].extend(v)
+            except Exception as e:
+                print(f"[WARN] failed to read chunk {cp}: {e}")
+
+        if self.by_uid:
+            for k, v in self.by_uid.items():
+                merged[int(k)].extend(v)
+            self.by_uid.clear()
+
+        self._atomic_save_dict(final_path, dict(merged))
+        print(f"[FINAL] wrote {final_path}  (uids={len(merged)})")
+
+        if not keep_chunks and chunk_paths:
+            for cp in chunk_paths:
+                try: os.remove(cp)
+                except Exception: pass
+            try: os.rmdir(chunks_dir)
+            except Exception: pass
+
+    # ------------- Legacy save methods (both write same structure) -------------
     def save_episode_npy(self, run_dir, filename="episode_data.npy"):
         """
-        Save the episode-wise telemetry data (.npy) into the specified run directory.
+        Legacy name. Writes the current in-RAM dict (by_uid) as a single .npy file.
+        For compatibility, same structure as save_slotwise_npy().
         """
-        import os
         os.makedirs(run_dir, exist_ok=True)
         path = os.path.join(run_dir, filename)
-
-        data = dict(self.by_uid)
-        np.save(path, data)
-        print(f"[SAVE] Saved episode data to {path}")
+        self._atomic_save_dict(path, dict(self.by_uid))
+        print(f"[SAVE] {path} (unified structure)")
 
     def save_slotwise_dat(self, run_dir, filename="slotwise_data.dat"):
         """
-        Save complete slotwise raw data (.dat) for later loading.
+        Raw pickle (if you need it for debugging). Not used by the plots.
         """
-        import os, pickle
         os.makedirs(run_dir, exist_ok=True)
-        path = os.path.join(run_dir, filename)  # ✅ build full file path
-
+        path = os.path.join(run_dir, filename)
         with open(path, "wb") as f:
             pickle.dump(self.by_uid, f)
+        print(f"[SAVE] {path} (pickle)")
 
     def save_slotwise_npy(self, run_dir, filename="slotwise_data.npy"):
         """
-        Save complete slotwise telemetry data in .npy format.
+        Legacy name. Writes the current in-RAM dict (by_uid) as a single .npy file.
+        For compatibility, same structure as save_episode_npy().
         """
-        import os
         os.makedirs(run_dir, exist_ok=True)
         path = os.path.join(run_dir, filename)
-        np.save(path, self.by_uid)
-        print(f"[SAVE] Saved slotwise data to {path}")
+        self._atomic_save_dict(path, dict(self.by_uid))
+        print(f"[SAVE] {path} (unified structure)")
 
-
+    # ------------- Simple AOI utilities -------------
     def compute_average_aoi(self, total_slots):
         uid_avg = {}
-
         for uid, rows in self.by_uid.items():
-            aoi_sum = sum(r["aoi"] for r in rows)
-            uid_avg[uid] = aoi_sum / total_slots
+            # robust against missing keys
+            aoi_sum = sum(float(r.get("aoi", 0.0)) for r in rows)
+            uid_avg[uid] = aoi_sum / max(int(total_slots), 1)
         return uid_avg
 
     def compute_system_aoi(self, total_slots):
         user_avgs = self.compute_average_aoi(total_slots)
+        vals = [v for v in user_avgs.values() if np.isfinite(v)]
+        return (sum(vals) / len(vals)) if vals else np.nan
 
-        return sum(user_avgs.values()) / len(user_avgs)
+    # ------------- helpers -------------
+    @staticmethod
+    def _atomic_save_dict(path, payload_dict):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=os.path.dirname(path) or ".")
+        os.close(fd)
+        try:
+            np.save(tmp, payload_dict, allow_pickle=True)
+            if os.path.exists(path):
+                os.remove(path)
+            os.replace(tmp, path)
+        except Exception:
+            try: os.remove(tmp)
+            except Exception: pass
+            raise
 
-telemetry = Telemetry()
+#telemetry = Telemetry()
 # The remaining logic for state construction, slot assignment, frame rollout,
 # .dat and .npy file generation, average AoI tracking, belief model for decoding probability,
 # and plotting routines should now be added below step-by-step.
@@ -1352,7 +1393,7 @@ def compute_average_aoi(telemetry, num_slots, num_frames, out_dir):
 
     # Save to .npy
     npy_path = os.path.join(out_dir, "avg_aoi_per_user.npy")
-    np.save(npy_path, avg_per_user)
+    #np.save(npy_path, avg_per_user)
 
     print(f"[SAVE] Saved AoI summary to {dat_path}")
     return system_avg
@@ -1702,6 +1743,51 @@ def compute_avg_aoi_per_episode(telemetry):
 
     return avg_aoi_per_user_per_ep, system_avg_per_ep
 
+import os, tempfile, json, numpy as np
+
+def flush_episode_safe(by_uid_dict, run_dir, M_total, num_slots, ep):
+    """
+    Save one episode chunk atomically:
+      {run_dir}/chunks/slotwise_data_epXXXX_U{M}S{S}.npy
+    Skips writing if there are no rows.
+    """
+    # Guard: no rows -> do not create an empty file
+    total_rows = sum(len(v) for v in by_uid_dict.values())
+    if total_rows == 0:
+        print(f"[FLUSH] ep={ep} has no rows; skipping chunk write.")
+        return None
+
+    chunks_dir = os.path.join(run_dir, "chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+    out_path = os.path.join(chunks_dir, f"slotwise_data_ep{int(ep):04d}_U{M_total}S{num_slots}.npy")
+
+    # Atomic write to local disk temp file, then replace.
+    dstdir = os.path.dirname(out_path) or "."
+    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=dstdir)
+    try:
+        # Write with numpy (close explicitly)
+        with os.fdopen(fd, "wb") as f:
+            #np.save(f, dict(by_uid_dict), allow_pickle=True)
+            f.flush()
+            os.fsync(f.fileno())
+        # Replace atomically
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        os.replace(tmp, out_path)
+    except Exception:
+        try: os.remove(tmp)
+        except: pass
+        raise
+
+    # Final sanity check: non-zero size
+    try:
+        sz = os.path.getsize(out_path)
+        print(f"[FLUSH] ep={ep} → {out_path} ({sz} bytes, rows={total_rows})")
+    except Exception:
+        print(f"[FLUSH] ep={ep} → {out_path} (size unknown, rows={total_rows})")
+
+    return out_path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -1714,6 +1800,67 @@ def load_episode_telemetry(run_dir, filename="episode_data.npy"):
     path = os.path.join(run_dir, filename)
     print(f"[LOAD] Loading episode data from {path}")
     return np.load(path, allow_pickle=True).item()
+
+import os, glob, numpy as np
+from collections import defaultdict
+
+def merge_chunks_safe(run_dir, M_total, num_slots, final_filename=None, delete_bad=False):
+    """
+    Merge all episode chunks into a single final file:
+      slotwise_dataU{M}S{S}.npy
+    Skips 0-byte and corrupted chunks. Returns the merged dict.
+    """
+    if final_filename is None:
+        final_filename = f"slotwise_dataU{M_total}S{num_slots}.npy"
+    final_path = os.path.join(run_dir, final_filename)
+
+    chunks_dir = os.path.join(run_dir, "chunks")
+    patt = os.path.join(chunks_dir, f"slotwise_data_ep*_U{M_total}S{num_slots}.npy")
+    paths = sorted(glob.glob(patt))
+
+    merged = defaultdict(list)
+    good, bad = 0, 0
+
+    for cp in paths:
+        try:
+            if not os.path.exists(cp) or os.path.getsize(cp) == 0:
+                bad += 1
+                print(f"[MERGE] skip empty: {os.path.basename(cp)}")
+                if delete_bad:
+                    try: os.remove(cp)
+                    except: pass
+                continue
+            d = np.load(cp, allow_pickle=True).item()
+            if not isinstance(d, dict):
+                bad += 1
+                print(f"[MERGE] skip non-dict: {os.path.basename(cp)}")
+                if delete_bad:
+                    try: os.remove(cp)
+                    except: pass
+                continue
+            for k, v in d.items():
+                merged[int(k)].extend(v)
+            good += 1
+        except Exception as e:
+            bad += 1
+            print(f"[MERGE] skip corrupt: {os.path.basename(cp)} ({e})")
+            if delete_bad:
+                try: os.remove(cp)
+                except: pass
+
+    total_rows = sum(len(v) for v in merged.values())
+    if total_rows == 0:
+        print(f"[FINAL] Nothing to write (good={good}, bad={bad}). Skipping final.")
+        return dict(merged)
+
+    # Atomic final save
+    tmp = final_path + ".tmp"
+    #np.save(tmp, dict(merged), allow_pickle=True)
+    if os.path.exists(final_path):
+        os.remove(final_path)
+    os.replace(tmp, final_path)
+    print(f"[FINAL] wrote {final_path} (uids={len(merged)}, rows={total_rows}, chunks: good={good}, bad={bad})")
+    return dict(merged)
 
 
 def plot_avg_aoi_per_user(data, num_slots, frames_per_episode, out_dir):
@@ -2092,6 +2239,7 @@ for i, u in enumerate(users):
 near_all, far_all = split_groups_by_distance(users, tau)
 allowed_near, idle_near, allowed_far, idle_far = init_allowed_idle(near_all, far_all, num_slots)
 #telemetry = new_buffer()  # episode buffer
+telemetry = Telemetry()
 
 for ep in range(1, num_episodes + 1):
 
@@ -2339,16 +2487,36 @@ for ep in range(1, num_episodes + 1):
         print(f"Ep {ep:4d}/{num_episodes}" ) #| AvgAoI={aoi_avg_ep[-1]:6.3f} | "
               #f"π_loss={stats['pi_loss']:.4f} | V_loss={stats['v_loss']:.4f} | "
               #f"Ent={stats['ent']:.4f} | KL={stats['kl']:.4f}")
-    telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
-    telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
+
+    path = flush_episode_safe(telemetry.by_uid, RUN_DIR, M_total, num_slots, ep)
+    telemetry.by_uid.clear()  # free RAM for next episode
+
+    #telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
+    #telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
 
 
 
 #episode_data = np.load(os.path.join(RUN_DIR, "episode_data.npy"), allow_pickle=True).item()
+# after the last episode:
+#telemetry.finalize_run(
+ #   RUN_DIR, M_total, num_slots,
+ #   final_filename=f"slotwise_dataU{M_total}S{num_slots}.npy",
+ #   keep_chunks=True  # set False to delete chunks after merging
+#)
 
-per_user_moving = compute_moving_avg_aoi_per_user(telemetry)
-user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(telemetry, num_slots)
-user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(telemetry)
+merged = merge_chunks_safe(RUN_DIR, M_total, num_slots,
+                           final_filename=f"slotwise_dataU{M_total}S{num_slots}.npy",
+                           delete_bad=False)
+
+# Now compute metrics from 'merged' (dict[uid] -> list[rows])
+per_user_moving = compute_moving_avg_aoi_per_user(merged)
+user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(merged, num_slots)
+user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(merged)
+
+
+#per_user_moving = compute_moving_avg_aoi_per_user(telemetry)
+#user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(telemetry, num_slots)
+#user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(telemetry)
 
 sar_logger.save(RUN_DIR, filename=f"sar_logU{M_total}S{num_slots}.pkl")
 

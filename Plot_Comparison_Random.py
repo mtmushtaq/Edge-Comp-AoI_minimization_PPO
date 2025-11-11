@@ -2253,6 +2253,7 @@ def plot_system_avg_aoi_timewise_strict(
         plt.close(fig2)
         print(f"[PLOT] System AoI (averages-only) saved → {out_path2}")
 
+
 import os, sqlite3, numpy as np, matplotlib.pyplot as plt, matplotlib as mpl, math
 
 def open_db(run_dir, filename="slotwise_data.sqlite"):
@@ -2273,6 +2274,7 @@ def iter_user_rows(conn, uid):
     for ep,fr,sl,aoi in cur.execute(q, (int(uid),)):
         yield int(ep), int(fr), int(sl), float(aoi)
 
+'''''''''
 def plot_moving_avg_aoi_per_user_sqlite(
     conn, num_slots, frames_per_episode, num_episodes,
     out_dir, out_pdf="All_Users_MovingAvgAoI.pdf",
@@ -2342,11 +2344,101 @@ def plot_moving_avg_aoi_per_user_sqlite(
     fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
     plt.close(fig)
     print(f"[PLOT] Saved → {out_path}")
+'''
 
-
-import os
+import os, math
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+
+def plot_moving_avg_aoi_per_user_sqlite(
+    conn, num_slots, frames_per_episode, num_episodes,
+    out_dir, out_pdf="All_Users_MovingAvgAoI.pdf",
+    episode_tick=5, y_min=None   # let y_min auto unless you really want a floor
+):
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family":"serif","mathtext.fontset":"stix","axes.unicode_minus":False,
+        "pdf.use14corefonts":True,"axes.labelsize":8,"xtick.labelsize":7,"ytick.labelsize":7,
+        "axes.linewidth":0.8,"lines.linewidth":1.1,"grid.linewidth":0.5,
+        "xtick.major.width":0.6,"ytick.major.width":0.6,
+    })
+
+    def list_uids(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT uid FROM logs ORDER BY uid")
+        return [row[0] for row in cur.fetchall()]
+
+    # **IMPORTANT**: make sure we fetch in strict time order
+    def iter_user_rows_ordered(conn, uid):
+        cur = conn.cursor()
+        q = ("SELECT ep, frame, slot, aoi FROM logs "
+             "WHERE uid=? ORDER BY ep ASC, frame ASC, slot ASC")
+        for ep, fr, sl, aoi in cur.execute(q, (int(uid),)):
+            yield int(ep), int(fr), int(sl), float(aoi)
+
+    uids = list_uids(conn)
+    T_ep  = int(num_slots) * int(frames_per_episode)
+    Ttot  = T_ep * int(num_episodes)
+    episode_end_slots = [(e*T_ep)-1 for e in range(1, num_episodes+1)]
+    xticks = episode_end_slots[::max(1, episode_tick)]
+
+    ncols, nrows = 3, max(1, math.ceil(len(uids)/3))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3*ncols, 2.1*nrows), squeeze=False)
+    axes = axes.ravel()
+
+    for ii, uid in enumerate(uids):
+        ax = axes[ii]
+
+        # ---- Gather rows then sort by global slot index g ----
+        rows = []
+        for ep, fr, sl, aoi in iter_user_rows_ordered(conn, uid):
+            if 1 <= ep <= num_episodes:
+                if 0 <= sl < num_slots and 0 <= fr < frames_per_episode:
+                    g = (ep-1)*T_ep + fr*num_slots + sl
+                    if 0 <= g < Ttot:
+                        rows.append((g, aoi))
+        if not rows:
+            ax.set_title(f"U{uid} (no data)", fontsize=8); ax.axis("off"); continue
+
+        rows.sort(key=lambda x: x[0])  # sort by global slot index
+        t_list = [g for g,_ in rows]
+        aoi_seq = np.array([a for _,a in rows], dtype=float)
+
+        # ---- Cumulative average over *sorted* time ----
+        cum = np.cumsum(aoi_seq)
+        idx = np.arange(1, len(aoi_seq)+1, dtype=float)
+        avg_list = (cum / idx).tolist()
+
+        # ---- Plot ----
+        ax.plot(t_list, avg_list, linestyle="-", linewidth=1.3, label=f"U{uid}")
+
+        # Mark each episode end if present
+        ends_present = sorted(set(t_list).intersection(episode_end_slots))
+        if ends_present:
+            pos = {t:i for i,t in enumerate(t_list)}
+            mark_y = [avg_list[pos[x]] for x in ends_present]
+            ax.plot(ends_present, mark_y, "o", markerfacecolor="none", markeredgecolor="green",
+                    markersize=4.5, linestyle="None")
+
+        if y_min is not None:
+            ax.set_ylim(bottom=y_min)
+        ax.set_xticks(xticks)
+        ax.set_xlim([0, Ttot])
+        ax.set_title(f"U{uid}", fontsize=8)
+        ax.set_xlabel("Global Slot Index"); ax.set_ylabel("Average AoI")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", frameon=False, fontsize=7)
+
+    for j in range(len(uids), nrows*ncols):
+        axes[j].axis("off")
+
+    fig.tight_layout(pad=0.6)
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {out_path}")
+
 
 def plot_system_avg_aoi_sqlite_ma(
     conn, num_slots, frames_per_episode, num_episodes,
@@ -2420,7 +2512,6 @@ def plot_system_avg_aoi_sqlite_ma(
     print(f"[PLOT] Saved → {out_path}")
 
     return system_avg_per_ep, ma_values
-
 
 def plot_system_avg_aoi_sqlite(
     conn, num_slots, frames_per_episode, num_episodes,
@@ -2704,22 +2795,717 @@ def plot_system_avg_aoi_timewise_strict(
     print(f"[PLOT] System AoI over time saved → {out_path}")
     '''
 
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 
-def make_run_dir(M_total, num_slots, num_episodes):
+def plot_episode_end_avg_and_variance_sqlite(
+    conn,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir,
+    out_pdf="system_episode_end_avg_var.pdf",
+    ddof=0,        # 0: population variance, 1: sample
+    sigma_shading=True  # whether to add ±1σ shading around system_end_avg
+):
+    """
+    For each episode:
+      - Compute users’ running-average AoI over slots in that episode.
+      - Record each user’s last running-average value and variance across time.
+      - Aggregate across users:
+          (1) system_end_avg  = mean of users’ final averages.
+          (2) system_end_var_intra = mean of users’ variances (temporal stability).
+          (3) system_end_var_inter = variance across users’ final averages (dispersion).
+      - Plot:
+          - Blue line = system_end_avg (AoI convergence)
+          - Red dashed = mean per-user variance (intra)
+          - Orange dash-dot = inter-user variance
+          - Optional orange shaded band = ±1σ across users at each episode end.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family":"serif","mathtext.fontset":"stix","axes.unicode_minus":False,
+        "pdf.use14corefonts":True,"axes.labelsize":8,"xtick.labelsize":7,"ytick.labelsize":7,
+        "axes.linewidth":0.8,"lines.linewidth":1.1,"grid.linewidth":0.5,
+        "xtick.major.width":0.6,"ytick.major.width":0.6,
+    })
+
+    T_ep = int(num_slots) * int(frames_per_episode)
+    Ttot = T_ep * int(num_episodes)
+
+    # Output arrays
+    system_end_avg = np.full(num_episodes, np.nan, dtype=float)
+    system_end_var_intra = np.full(num_episodes, np.nan, dtype=float)
+    system_end_var_inter = np.full(num_episodes, np.nan, dtype=float)
+    x_pos = np.array([(e * T_ep) - 1 for e in range(1, num_episodes + 1)], dtype=int)
+
+    cur = conn.cursor()
+
+    for e in range(1, num_episodes + 1):
+        cum_sum, n_seen, mean_m, M2_m, last_m = {}, {}, {}, {}, {}
+
+        q = ("SELECT uid, aoi FROM logs "
+             "WHERE ep=? ORDER BY frame ASC, slot ASC, uid ASC")
+        for uid, aoi in cur.execute(q, (e,)):
+            uid = int(uid); aoi = float(aoi)
+            if uid not in n_seen:
+                n_seen[uid]  = 0
+                cum_sum[uid] = 0.0
+                mean_m[uid]  = 0.0
+                M2_m[uid]    = 0.0
+
+            n_seen[uid]  += 1
+            cum_sum[uid] += aoi
+            m_t = cum_sum[uid] / n_seen[uid]
+            last_m[uid] = m_t
+
+            # Welford’s algorithm for variance of m_t sequence
+            n = n_seen[uid]
+            if n == 1:
+                mean_m[uid] = m_t
+                M2_m[uid]   = 0.0
+            else:
+                delta = m_t - mean_m[uid]
+                mean_m[uid] += delta / n
+                M2_m[uid]   += delta * (m_t - mean_m[uid])
+
+        # Aggregate across users
+        end_vals, var_vals = [], []
+        for uid in last_m.keys():
+            end_vals.append(last_m[uid])
+            n = n_seen[uid]
+            if n - ddof > 0:
+                var_vals.append(M2_m[uid] / (n - ddof))
+            else:
+                var_vals.append(np.nan)
+
+        if end_vals:
+            end_vals = np.array(end_vals, dtype=float)
+            system_end_avg[e - 1] = np.nanmean(end_vals)
+            system_end_var_inter[e - 1] = np.nanvar(end_vals, ddof=ddof)
+        if var_vals:
+            system_end_var_intra[e - 1] = np.nanmean(var_vals)
+
+    # --- Plotting ---
+    fig, ax = plt.subplots(figsize=(7.8, 3.2))
+    ax.plot(x_pos, system_end_avg, marker="o", linestyle="-", linewidth=1.4,
+            markersize=4.0, color="tab:blue", label="System episode-end avg AoI")
+
+    # ±1σ shading from inter-user variance
+    if sigma_shading and np.isfinite(system_end_var_inter).any():
+        std_band = np.sqrt(system_end_var_inter)
+        upper = system_end_avg + std_band
+        lower = system_end_avg - std_band
+        ax.fill_between(x_pos, lower, upper, color="tab:orange", alpha=0.15,
+                        label="±1σ (inter-user spread)")
+
+    # vertical lines for episodes
+    for xb in range(0, Ttot + 1, T_ep):
+        ax.axvline(xb, color="0.9", linewidth=0.6, zorder=0)
+
+    ax.set_xlim(-0.5, max(x_pos) + 0.5)
+    ax.set_xlabel("Global slot index (episode ends)")
+    ax.set_ylabel("AoI")
+    ax.set_title("System Average AoI and Variances per Episode End")
+    ax.grid(True, alpha=0.3)
+
+    # Right axis for variances
+    ax_r = ax.twinx()
+    finite_intra = np.isfinite(system_end_var_intra)
+    finite_inter = np.isfinite(system_end_var_inter)
+
+    lines, labels = [], []
+    if finite_intra.any():
+        l = ax_r.plot(x_pos[finite_intra], np.sqrt(system_end_var_intra[finite_intra]),
+                      marker="s", linestyle="--", linewidth=1.0, markersize=4.0,
+                      color="tab:red", label="Mean user variance (intra)")[
+            0
+        ]
+        lines.append(l); labels.append(l.get_label())
+
+    if finite_inter.any():
+        l = ax_r.plot(x_pos[finite_inter], np.sqrt(system_end_var_inter[finite_inter]),
+                      marker="^", linestyle="-.", linewidth=1.0, markersize=4.0,
+                      color="tab:orange", label="Variance across users (inter)")[
+            0
+        ]
+        lines.append(l); labels.append(l.get_label())
+
+    if lines:
+        l1, lab1 = ax.get_legend_handles_labels()
+        ax.legend(l1 + lines, lab1 + labels, frameon=False, fontsize=7, loc="best")
+        ax_r.set_ylabel("Variance")
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {out_path}")
+
+    return {
+        "episode_end_x": x_pos,
+        "system_end_avg": system_end_avg,
+        "system_end_var_intra": system_end_var_intra,
+        "system_end_var_inter": system_end_var_inter,
+    }
+
+
+def plot_system_avg_aoi_timewise_strict_sqlite_var(
+    conn,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir,
+    out_pdf="system_aoi_time_avg.pdf",
+    rolling_window=None,            # e.g., 1000
+    include_per_slot_in_main=True,
+    save_avg_only=True,
+    avg_only_pdf="system_aoi_time_avg_only.pdf"
+):
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "mathtext.fontset": "stix",
+        "axes.unicode_minus": False,
+        "pdf.use14corefonts": True,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "axes.linewidth": 0.8,
+        "lines.linewidth": 1.1,
+        "grid.linewidth": 0.5,
+        "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6,
+    })
+
+    T_ep = int(num_slots) * int(frames_per_episode)
+    Ttot = T_ep * int(num_episodes)
+
+    # ---------- Aggregate per-slot mean AoI ----------
+    sum_per_t = np.zeros(Ttot, dtype=float)
+    cnt_per_t = np.zeros(Ttot, dtype=int)
+
+    cur = conn.cursor()
+    q = "SELECT ep,frame,slot,aoi FROM logs ORDER BY ep,frame,slot,uid"
+    for ep, fr, sl, aoi in cur.execute(q):
+        ep = int(ep)
+        fr = int(fr)
+        sl = int(sl)
+        if 1 <= ep <= num_episodes:
+            g = (ep - 1) * T_ep + fr * num_slots + sl
+            if 0 <= g < Ttot:
+                sum_per_t[g] += float(aoi)
+                cnt_per_t[g] += 1
+
+    per_slot_mean = np.full(Ttot, np.nan)
+    mask = cnt_per_t > 0
+    per_slot_mean[mask] = sum_per_t[mask] / cnt_per_t[mask]
+
+    # forward-fill missing slots
+    last = np.nan
+    for i in range(Ttot):
+        if np.isfinite(per_slot_mean[i]):
+            last = per_slot_mean[i]
+        else:
+            per_slot_mean[i] = last
+
+    # ---------- Running mean AoI ----------
+    valid = np.isfinite(per_slot_mean)
+    ps = np.where(valid, per_slot_mean, 0.0)
+    w = np.where(valid, 1.0, 0.0)
+    csum = np.cumsum(ps)
+    wsum = np.cumsum(w)
+    running_mean = np.divide(csum, np.maximum(wsum, 1e-12))
+
+    # ---------- Rolling mean ----------
+    roll_curve = None
+    if rolling_window and rolling_window > 1:
+        k = int(rolling_window)
+        kernel = np.ones(k) / k
+        num = np.convolve(ps, kernel, mode="same")
+        den = np.convolve(w, kernel, mode="same")
+        roll_curve = np.divide(num, np.maximum(den, 1e-12))
+
+    # ---------- Variance of running mean per episode ----------
+    ep_var = np.full(num_episodes, np.nan)
+    ep_pos = np.zeros(num_episodes, dtype=int)
+
+    for e in range(1, num_episodes + 1):
+        t0 = (e - 1) * T_ep
+        t1 = e * T_ep
+        seg = running_mean[t0:t1]
+        seg = seg[np.isfinite(seg)]
+        if seg.size > 1:
+            ep_var[e - 1] = np.var(seg, ddof=1)  # sample variance
+        ep_pos[e - 1] = t1 - 1  # plot position at episode end
+
+    # ---------- Plot ----------
+    x = np.arange(Ttot)
+    episode_bounds = [i * T_ep for i in range(0, num_episodes + 1)]
+    var_ok = np.isfinite(ep_var)
+
+    # ========== Figure 1: main ==========
+    fig, ax = plt.subplots(figsize=(7.8, 3.2))
+    if include_per_slot_in_main:
+        ax.plot(x, per_slot_mean, linewidth=0.9, alpha=0.35, label="Per-slot mean AoI")
+    ax.plot(x, running_mean, linewidth=1.6, label="Running mean AoI (system)")
+    if roll_curve is not None:
+        ax.plot(x, roll_curve, linestyle="--", linewidth=1.2,
+                label=f"Rolling mean (w={rolling_window})")
+
+    for eb in episode_bounds:
+        ax.axvline(eb, color="0.88", linewidth=0.7, zorder=0)
+
+    ax.set_xlim(0, Ttot - 1)
+    ax.set_xlabel("Slot Index")
+    ax.set_ylabel("AoI")
+    ax.set_title("System Average AoI Over Time")
+    ax.grid(True, alpha=0.3)
+
+    # variance on secondary y-axis
+    ax_r = ax.twinx()
+    if var_ok.any():
+        ax_r.plot(ep_pos[var_ok], ep_var[var_ok],
+                  marker="o", markersize=3.5, linewidth=0.9, alpha=0.85, color="tab:red",
+                  label="Variance of running mean AoI (per episode)")
+        ax_r.set_ylabel("Variance (per episode)", rotation=270, labelpad=12)
+
+        l1, lab1 = ax.get_legend_handles_labels()
+        l2, lab2 = ax_r.get_legend_handles_labels()
+        ax.legend(l1 + l2, lab1 + lab2, frameon=False, fontsize=7, ncols=2, loc="best")
+    else:
+        ax.legend(frameon=False, fontsize=7, ncols=2, loc="best")
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {out_path}")
+
+    # ========== Figure 2: averages only ==========
+    if save_avg_only:
+        fig2, axL = plt.subplots(figsize=(7.8, 3.2))
+        axL.plot(x, running_mean, linewidth=1.8, label="Running mean AoI (system)")
+        if roll_curve is not None:
+            axL.plot(x, roll_curve, linestyle="--", linewidth=1.4,
+                     label=f"Rolling mean (w={rolling_window})")
+        for eb in episode_bounds:
+            axL.axvline(eb, color="0.9", linewidth=0.6, zorder=0)
+
+        axL.set_xlim(0, Ttot - 1)
+        axL.set_xlabel("Slot Index")
+        axL.set_ylabel("AoI")
+        axL.set_title("System AoI — Averages Only")
+        axL.grid(True, alpha=0.3)
+
+        axR = axL.twinx()
+        if var_ok.any():
+            axR.plot(ep_pos[var_ok], ep_var[var_ok],
+                     marker="o", markersize=3.5, linewidth=0.9, alpha=0.85, color="tab:red",
+                     label="Variance of running mean AoI (per episode)")
+            axR.set_ylabel("Variance (per episode)", rotation=270, labelpad=12)
+            l1, lab1 = axL.get_legend_handles_labels()
+            l2, lab2 = axR.get_legend_handles_labels()
+            axL.legend(l1 + l2, lab1 + lab2, frameon=False, fontsize=7, ncols=2, loc="best")
+        else:
+            axL.legend(frameon=False, fontsize=7, ncols=2, loc="best")
+
+        fig2.tight_layout()
+        out_path2 = os.path.join(out_dir, avg_only_pdf)
+        fig2.savefig(out_path2, dpi=600, format="pdf", bbox_inches="tight")
+        plt.close(fig2)
+        print(f"[PLOT] Saved → {out_path2}")
+
+    return dict(
+        per_slot_mean=per_slot_mean,
+        running_mean=running_mean,
+        rolling_mean=roll_curve,
+        running_mean_var=ep_var,
+        running_mean_var_x=ep_pos
+    )
+
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+def plot_system_avg_aoi_timewise_strict_sqlite_varuser(
+    conn,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir,
+    out_pdf="system_aoi_time_avg.pdf",
+    rolling_window=None,            # e.g., 1000
+    include_per_slot_in_main=True,
+    save_avg_only=True,
+    avg_only_pdf="system_aoi_time_avg_only.pdf",
+    ep_end_var_ddof=0               # 0 = population variance, 1 = sample variance
+):
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family":"serif","mathtext.fontset":"stix","axes.unicode_minus":False,
+        "pdf.use14corefonts":True,"axes.labelsize":8,"xtick.labelsize":7,"ytick.labelsize":7,
+        "axes.linewidth":0.8,"lines.linewidth":1.1,"grid.linewidth":0.5,
+        "xtick.major.width":0.6,"ytick.major.width":0.6,
+    })
+
+    T_ep  = int(num_slots) * int(frames_per_episode)
+    Ttot  = T_ep * int(num_episodes)
+
+    # ---- Per-slot mean AoI across users (streamed) ----
+    sum_per_t = np.zeros(Ttot, dtype=float)
+    cnt_per_t = np.zeros(Ttot, dtype=int)
+
+    cur = conn.cursor()
+    q = "SELECT ep,frame,slot,aoi FROM logs ORDER BY ep,frame,slot,uid"
+    for ep, fr, sl, aoi in cur.execute(q):
+        ep = int(ep); fr = int(fr); sl = int(sl)
+        if 1 <= ep <= num_episodes:
+            g = (ep - 1) * T_ep + fr * num_slots + sl
+            if 0 <= g < Ttot:
+                sum_per_t[g] += float(aoi)
+                cnt_per_t[g] += 1
+
+    per_slot_mean = np.full(Ttot, np.nan, dtype=float)
+    mask = cnt_per_t > 0
+    per_slot_mean[mask] = sum_per_t[mask] / cnt_per_t[mask]
+    # forward-fill
+    last = np.nan
+    for i in range(Ttot):
+        if np.isfinite(per_slot_mean[i]):
+            last = per_slot_mean[i]
+        else:
+            per_slot_mean[i] = last
+
+    # ---- Running mean over time ----
+    valid = np.isfinite(per_slot_mean)
+    ps = np.where(valid, per_slot_mean, 0.0)
+    w  = np.where(valid, 1.0, 0.0)
+    csum = np.cumsum(ps); wsum = np.cumsum(w)
+    running_mean = np.divide(csum, np.maximum(wsum, 1e-12))
+
+    # ---- Optional rolling mean ----
+    roll_curve = None
+    if rolling_window and rolling_window > 1:
+        k = int(rolling_window)
+        kernel = np.ones(k) / k
+        num = np.convolve(ps, kernel, mode="same")
+        den = np.convolve(w,  kernel, mode="same")
+        roll_curve = np.divide(num, np.maximum(den, 1e-12))
+
+    # ---- NEW: Cross-sectional variance across users at episode end ----
+    # At each episode end (frame = F-1, slot = S-1),
+    # take the AoI across all users and compute variance.
+    ep_end_frame = frames_per_episode - 1
+    ep_end_slot  = num_slots - 1
+
+    ep_end_var = np.full(num_episodes, np.nan, dtype=float)   # variance across users
+    ep_end_mean = np.full(num_episodes, np.nan, dtype=float)  # (optional) mean across users at ep-end
+    ep_pos = np.zeros(num_episodes, dtype=int)                # x-position to plot: episode end index
+
+    q_end = ("SELECT aoi FROM logs WHERE ep=? AND frame=? AND slot=?")
+    for e in range(1, num_episodes + 1):
+        vals = [float(r[0]) for r in cur.execute(q_end, (e, ep_end_frame, ep_end_slot))]
+        if len(vals) >= 2:
+            ep_end_var[e - 1] = np.var(vals, ddof=ep_end_var_ddof)
+            ep_end_mean[e - 1] = float(np.mean(vals))
+        elif len(vals) == 1:
+            ep_end_var[e - 1] = 0.0
+            ep_end_mean[e - 1] = vals[0]
+        ep_pos[e - 1] = e * T_ep - 1
+
+    # ---- Plotting ----
+    x = np.arange(Ttot)
+    episode_bounds = [i * T_ep for i in range(0, num_episodes + 1)]
+    var_ok = np.isfinite(ep_end_var)
+
+    # ===================== Figure 1: main =====================
+    fig, ax = plt.subplots(figsize=(7.8, 3.2))
+    if include_per_slot_in_main:
+        ax.plot(x, per_slot_mean, linewidth=0.9, alpha=0.35, label="Per-slot mean AoI")
+    ax.plot(x, running_mean, linewidth=1.6, label="Running mean AoI (system)")
+    if roll_curve is not None:
+        ax.plot(x, roll_curve, linestyle="--", linewidth=1.2,
+                label=f"Rolling mean (w={rolling_window})")
+
+    for eb in episode_bounds:
+        ax.axvline(eb, color="0.88", linewidth=0.7, zorder=0)
+
+    ax.set_xlim(0, Ttot - 1)
+    ax.set_xlabel("Slot Index")
+    ax.set_ylabel("AoI")
+    ax.set_title("System Average AoI Over Time")
+    ax.grid(True, alpha=0.3)
+
+    # Secondary Y-axis: variance across users at episode end
+    ax_r = ax.twinx()
+    if var_ok.any():
+        ax_r.plot(ep_pos[var_ok], ep_end_var[var_ok],
+                  marker="o", markersize=3.5, linewidth=0.9, alpha=0.9, color="tab:red",
+                  label="Variance across users at episode end")
+        ax_r.set_ylabel("Cross-sectional variance", rotation=270, labelpad=12)
+
+        # unified legend
+        l1, lab1 = ax.get_legend_handles_labels()
+        l2, lab2 = ax_r.get_legend_handles_labels()
+        ax.legend(l1 + l2, lab1 + lab2, frameon=False, fontsize=7, ncols=2, loc="best")
+    else:
+        ax.legend(frameon=False, fontsize=7, ncols=2, loc="best")
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {out_path}")
+
+    # ===================== Figure 2: averages only =====================
+    if save_avg_only:
+        fig2, axL = plt.subplots(figsize=(7.8, 3.2))
+        axL.plot(x, running_mean, linewidth=1.8, label="Running mean AoI (system)")
+        if roll_curve is not None:
+            axL.plot(x, roll_curve, linestyle="--", linewidth=1.4,
+                     label=f"Rolling mean (w={rolling_window})")
+        for eb in episode_bounds:
+            axL.axvline(eb, color="0.9", linewidth=0.6, zorder=0)
+
+        axL.set_xlim(0, Ttot - 1)
+        axL.set_xlabel("Slot Index")
+        axL.set_ylabel("AoI")
+        axL.set_title("System AoI — Averages Only")
+        axL.grid(True, alpha=0.3)
+
+        axR = axL.twinx()
+        if var_ok.any():
+            axR.plot(ep_pos[var_ok], ep_end_var[var_ok],
+                     marker="o", markersize=3.5, linewidth=0.9, alpha=0.9, color="tab:red",
+                     label="Variance across users at episode end")
+            axR.set_ylabel("Cross-sectional variance", rotation=270, labelpad=12)
+            l1, lab1 = axL.get_legend_handles_labels()
+            l2, lab2 = axR.get_legend_handles_labels()
+            axL.legend(l1 + l2, lab1 + lab2, frameon=False, fontsize=7, ncols=2, loc="best")
+        else:
+            axL.legend(frameon=False, fontsize=7, ncols=2, loc="best")
+
+        fig2.tight_layout()
+        out_path2 = os.path.join(out_dir, avg_only_pdf if avg_only_pdf else "system_aoi_time_avg_only.pdf")
+        fig2.savefig(out_path2, dpi=600, format="pdf", bbox_inches="tight")
+        plt.close(fig2)
+        print(f"[PLOT] Saved → {out_path2}")
+
+    return dict(
+        per_slot_mean=per_slot_mean,
+        running_mean=running_mean,
+        rolling_mean=roll_curve,
+        ep_end_var=ep_end_var,
+        ep_end_var_x=ep_pos,
+        ep_end_mean=ep_end_mean
+    )
+
+import os, sqlite3, numpy as np, matplotlib as mpl, matplotlib.pyplot as plt
+
+def _compute_episode_end_stats(conn, num_slots, frames_per_episode, num_episodes, ddof=0):
+    """
+    For each episode e:
+      - For each user u:
+          * stream AoI ordered by (frame, slot)
+          * build running avg m_u(t) over the episode
+          * keep last value m_u(T)
+          * compute Var(m_u(1..T)) via Welford
+      - Aggregate across users:
+          * system_end_avg[e]        = mean_u m_u(T)
+          * system_end_var_intra[e]  = mean_u Var(m_u(1..T))
+          * system_end_var_inter[e]  = var_u  m_u(T)
+    Returns dict with arrays and x positions (episode end slot indices).
+    """
+    T_ep = int(num_slots) * int(frames_per_episode)
+    system_end_avg        = np.full(num_episodes, np.nan, dtype=float)
+    system_end_var_intra  = np.full(num_episodes, np.nan, dtype=float)
+    system_end_var_inter  = np.full(num_episodes, np.nan, dtype=float)
+    x_pos = np.array([(e * T_ep) - 1 for e in range(1, num_episodes + 1)], dtype=int)
+
+    cur = conn.cursor()
+    for e in range(1, num_episodes + 1):
+        cum_sum, n_seen, mean_m, M2_m, last_m = {}, {}, {}, {}, {}
+
+        q = ("SELECT uid, aoi FROM logs "
+             "WHERE ep=? ORDER BY frame ASC, slot ASC, uid ASC")
+        for uid, aoi in cur.execute(q, (e,)):
+            uid = int(uid); aoi = float(aoi)
+            if uid not in n_seen:
+                n_seen[uid]  = 0
+                cum_sum[uid] = 0.0
+                mean_m[uid]  = 0.0
+                M2_m[uid]    = 0.0
+
+            n_seen[uid]  += 1
+            cum_sum[uid] += aoi
+            m_t = cum_sum[uid] / n_seen[uid]
+            last_m[uid] = m_t
+
+            # Welford on m_u sequence
+            n = n_seen[uid]
+            if n == 1:
+                mean_m[uid] = m_t
+                M2_m[uid]   = 0.0
+            else:
+                d = m_t - mean_m[uid]
+                mean_m[uid] += d / n
+                M2_m[uid]   += d * (m_t - mean_m[uid])
+
+        end_vals, var_vals = [], []
+        for uid in last_m.keys():
+            end_vals.append(last_m[uid])
+            n = n_seen[uid]
+            var_vals.append(M2_m[uid] / (n - ddof) if (n - ddof) > 0 else np.nan)
+
+        if end_vals:
+            end_vals = np.array(end_vals, dtype=float)
+            system_end_avg[e - 1]       = np.nanmean(end_vals)
+            system_end_var_inter[e - 1] = np.nanvar(end_vals, ddof=ddof)
+        if var_vals:
+            system_end_var_intra[e - 1] = np.nanmean(var_vals)
+
+    return dict(
+        x_pos=x_pos,
+        system_end_avg=system_end_avg,
+        system_end_var_intra=system_end_var_intra,
+        system_end_var_inter=system_end_var_inter
+    )
+
+def plot_compare_episode_end_avg_and_variance_sqlite(
+    db_path_ppo,
+    db_path_random,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir,
+    out_pdf="compare_episode_end_avg_var_PPO_vs_RNDM.pdf",
+    ddof=0,
+    sigma_shading=True
+):
+    os.makedirs(out_dir, exist_ok=True)
+    mpl.rcParams.update({
+        "font.family":"serif","mathtext.fontset":"stix","axes.unicode_minus":False,
+        "pdf.use14corefonts":True,"axes.labelsize":8,"xtick.labelsize":7,"ytick.labelsize":7,
+        "axes.linewidth":0.8,"lines.linewidth":1.2,"grid.linewidth":0.5,
+        "xtick.major.width":0.6,"ytick.major.width":0.6,
+    })
+    T_ep  = int(num_slots) * int(frames_per_episode)
+    Ttot  = T_ep * int(num_episodes)
+
+    # Load stats for both runs
+    with sqlite3.connect(db_path_ppo) as c1, sqlite3.connect(db_path_random) as c2:
+        S1 = _compute_episode_end_stats(c1, num_slots, frames_per_episode, num_episodes, ddof=ddof)
+        S2 = _compute_episode_end_stats(c2, num_slots, frames_per_episode, num_episodes, ddof=ddof)
+
+    x1 = S1["x_pos"]; x2 = S2["x_pos"]
+    # Left axis: system episode-end average AoI
+    fig, ax = plt.subplots(figsize=(8.6, 3.4))
+
+    # PPO line
+    ln1 = ax.plot(x1, S1["system_end_avg"], marker="o", linestyle="-", linewidth=1.6,
+                  markersize=4.2, color="tab:blue", label="PPO: episode-end avg AoI")[0]
+    # Random line
+    ln2 = ax.plot(x2, S2["system_end_avg"], marker="o", linestyle="-", linewidth=1.6,
+                  markersize=4.2, color="tab:green", label="Random: episode-end avg AoI")[0]
+
+    # ±1σ shading from inter-user variance (each run)
+    if sigma_shading:
+        if np.isfinite(S1["system_end_var_inter"]).any():
+            s1 = np.sqrt(S1["system_end_var_inter"])
+            ax.fill_between(x1, S1["system_end_avg"] - s1, S1["system_end_avg"] + s1,
+                            color="tab:blue", alpha=0.12, label="PPO ±1σ (inter-user)")
+        if np.isfinite(S2["system_end_var_inter"]).any():
+            s2 = np.sqrt(S2["system_end_var_inter"])
+            ax.fill_between(x2, S2["system_end_avg"] - s2, S2["system_end_avg"] + s2,
+                            color="tab:green", alpha=0.12, label="Random ±1σ (inter-user)")
+
+    # Episode boundaries
+    for xb in range(0, Ttot + 1, T_ep):
+        ax.axvline(xb, color="0.90", linewidth=0.7, zorder=0)
+
+    ax.set_xlim(-0.5, max(x1.max(), x2.max()) + 0.5)
+    ax.set_xlabel("Global slot index (episode ends)")
+    ax.set_ylabel("AoI")
+    ax.set_title("PPO vs Random — System Episode-End AoI and Variance")
+    ax.grid(True, alpha=0.3)
+
+    # Right axis: std (sqrt variance) curves for intra/inter
+    ax_r = ax.twinx()
+
+    # PPO stds
+    ok1_intra = np.isfinite(S1["system_end_var_intra"])
+    ok1_inter = np.isfinite(S1["system_end_var_inter"])
+    lns_right = []
+    labs_right = []
+
+    if ok1_intra.any():
+        l = ax_r.plot(x1[ok1_intra], np.sqrt(S1["system_end_var_intra"][ok1_intra]),
+                      marker="s", linestyle="--", linewidth=1.2, markersize=3.8,
+                      color="tab:red", label="PPO σ (intra user)")[0]
+        lns_right.append(l); labs_right.append(l.get_label())
+    if ok1_inter.any():
+        l = ax_r.plot(x1[ok1_inter], np.sqrt(S1["system_end_var_inter"][ok1_inter]),
+                      marker="^", linestyle="-.", linewidth=1.2, markersize=3.8,
+                      color="tab:orange", label="PPO σ (inter user)")[0]
+        lns_right.append(l); labs_right.append(l.get_label())
+
+    # Random stds
+    ok2_intra = np.isfinite(S2["system_end_var_intra"])
+    ok2_inter = np.isfinite(S2["system_end_var_inter"])
+    if ok2_intra.any():
+        l = ax_r.plot(x2[ok2_intra], np.sqrt(S2["system_end_var_intra"][ok2_intra]),
+                      marker="s", linestyle="--", linewidth=1.2, markersize=3.8,
+                      color="tab:pink", label="Random σ (intra user)")[0]
+        lns_right.append(l); labs_right.append(l.get_label())
+    if ok2_inter.any():
+        l = ax_r.plot(x2[ok2_inter], np.sqrt(S2["system_end_var_inter"][ok2_inter]),
+                      marker="^", linestyle="-.", linewidth=1.2, markersize=3.8,
+                      color="goldenrod", label="Random σ (inter user)")[0]
+        lns_right.append(l); labs_right.append(l.get_label())
+
+    if lns_right:
+        l_left, lb_left = ax.get_legend_handles_labels()
+        ax.legend(l_left + lns_right, lb_left + labs_right, frameon=False, fontsize=7, loc="best")
+        ax_r.set_ylabel("Std dev at episode end")
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, out_pdf)
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {out_path}")
+
+    return {"ppo": S1, "random": S2, "x_max": int(max(x1.max(), x2.max()))}
+
+
+def make_run_dir(M_total, num_slots, num_episodes, protocol, gamma_th):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_EP{num_episodes}_DeltaR"
-    out = os.path.join(name)
-    os.makedirs(out, exist_ok=True)
-    return out
+    if protocol == "PPO":
+        name = f"AoI_U{M_total}_S{num_slots}_EP{num_episodes}_GTH{gamma_th}"
+        out = os.path.join(name)
+        os.makedirs(out, exist_ok=True)
+        return out
+    elif protocol == "random":
+        name = f"AoI_U{M_total}_S{num_slots}_EP{num_episodes}_{gamma_th}RNDM"
+        out = os.path.join(name)
+        os.makedirs(out, exist_ok=True)
+        return out
 
 
 # ------------------- Environment params (yours) -------------------
 num_slots          = 5
 frames_per_episode = 200
-num_episodes       = 199
-M_total            = 12
+num_episodes       = 400
+M_total            = 30
 
-gamma_th_db = 0
+gamma_th_db = -10
 # if you used a manual seed somewhere, define it here once
 seed = 42
 seed_value = globals().get("seed", None)
@@ -2735,15 +3521,17 @@ run_meta = {
     "np_seed_state": str(np.random.get_state()[1][0]),
     "notes": "PPO AoI run"
 }
-
-RUN_DIR = make_run_dir(M_total, num_slots, num_episodes)
+gamma_th_db        = -10
+gamma_th           = 10 ** (gamma_th_db / 10.0)
+RUN_DIR_PPO = make_run_dir(M_total, num_slots, num_episodes, "PPO", gamma_th = gamma_th)
+RUN_DIR_RANDOM = make_run_dir(M_total, num_slots, num_episodes, "random", gamma_th = gamma_th)
 
 
 # 4. >>> SAVE META FILE HERE <<<
 #with open(os.path.join(RUN_DIR, "meta.json"), "w") as f:
  #   json.dump(run_meta, f, indent=2)
 
-print(f"[SAVE] Run dir accessed: {RUN_DIR}")
+print(f"[SAVE] Run dir accessed: {RUN_DIR_RANDOM}, {RUN_DIR_PPO}")
 
 '''''''''
 data = load_episode_telemetry(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
@@ -2758,31 +3546,13 @@ plot_moving_avg_aoi_per_user(
     episode_tick=5
 )
 
+'''
+#plot_system_avg_aoi(data, num_slots=num_slots, frames_per_episode=frames_per_episode,  out_dir=RUN_DIR, out_pdf="system_avg_aoicluster2.pdf")
 
-plot_system_avg_aoi(data, num_slots=num_slots, frames_per_episode=frames_per_episode,  out_dir=RUN_DIR, out_pdf="system_avg_aoicluster2.pdf")
-
-plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=1000)
+#plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=1000)
 
 #plot_time_averaged_system_aoi(data, num_slots, frames_per_episode, RUN_DIR, out_pdf="system_aoi_time_avg.pdf")
 
-plot_state_action_pair_aoi(
-    sar_log_dir=RUN_DIR,
-    M_total=M_total,
-    num_slots=num_slots,
-    out_dir=RUN_DIR,
-    n_bins_1d=25,
-    n_bins_2d=30,
-    clip_percentiles=(0.5, 99.5),
-    figure_dpi=600
-)
-
-plot_policy_analytics_modern(
-    sar_log_dir=RUN_DIR,
-    M_total=M_total,
-    num_slots=num_slots,
-    pretty_labels=True
-
-)
 
 #plot_system_avg_aoi_timewise_strict(
  #   data=data,
@@ -2800,22 +3570,7 @@ plot_policy_analytics_modern(
 
 #plot_all_users_aoi(telemetry, num_slots, frames_per_episode,  out_pdf="AOI_All_Users.pdf", out_dir=RUN_DIR)
 #plot_all_users_energy(telemetry, num_slots, frames_per_episode, out_pdf="Energy_All_Users.pdf", out_dir=RUN_DIR)
-plot_system_avg_aoi_timewise_strict(
-    data,
-    num_slots,
-    frames_per_episode,
-    num_episodes,
-    RUN_DIR,
-    out_pdf="system_aoi_time_avg.pdf",
-    also_plot_mean_of_user_mavgs=False,
-    rolling_window=1,                # e.g., 1000 for a smoother auxiliary curve
-    include_per_slot_in_main=False,      # True -> keep thin per-slot mean in the main figure
-    save_avg_only=True,                 # True -> also save a second "averages-only" figure
-    avg_only_pdf="system_aoi_time_avg_only.pdf",
-    avg_ylim_clip=(100, 210),              # y-axis clips by percentiles of average curves for better scale
-)
 
-'''''
 '''''''''
 plot_state_action_pair_aoi(
     sar_log_dir=RUN_DIR,
@@ -2841,7 +3596,6 @@ plot_policy_analytics_modern(
 plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=100)
 
 
-
 analyze_system_success_history_from_sar(
     sar_log_dir = RUN_DIR,
     M_total = M_total,
@@ -2854,17 +3608,6 @@ analyze_system_success_history_from_sar(
 )
 
 
-plot_state_action_pair_aoi(
-    sar_log_dir=RUN_DIR,
-    M_total=M_total,
-    num_slots=num_slots,
-    out_dir=RUN_DIR,
-    n_bins_1d=25,
-    n_bins_2d=30,
-    clip_percentiles=(0.5, 99.5),
-    figure_dpi=600
-)
-
 metrics = plot_episode_reward_curves_from_sar(
     sar_log_dir=RUN_DIR,         # wherever sar_logU{M_total}S{num_slots}.pkl lives
     M_total=M_total,
@@ -2875,8 +3618,10 @@ metrics = plot_episode_reward_curves_from_sar(
     ma_window=10,
 )
 
-conn = open_db(RUN_DIR, "slotwise_data.sqlite")
+'''
+#conn_ppo = open_db(RUN_DIR_PPO, "slotwise_data.sqlite")
 
+'''''''''
 plot_moving_avg_aoi_per_user_sqlite(
     conn, num_slots, frames_per_episode, num_episodes,
     out_dir=os.path.join(RUN_DIR,"AoI Analysis"),
@@ -2885,26 +3630,70 @@ plot_moving_avg_aoi_per_user_sqlite(
 )
 
 
-conn = open_db(RUN_DIR, "slotwise_data.sqlite")
+plot_system_avg_aoi_sqlite(
+    conn, num_slots, frames_per_episode, num_episodes,
+    out_dir=os.path.join(RUN_DIR,"AoI Analysis"),
+    out_pdf="system_avg_aoi.pdf"
+)
 
-#plot_system_avg_aoi_sqlite(
-#    conn, num_slots, frames_per_episode, num_episodes,
-#    out_dir=os.path.join(RUN_DIR,"AoI Analysis"),
-#    out_pdf="system_avg_aoi.pdf"
-#)
-
-plot_system_avg_aoi_sqlite_ma(conn, num_slots, frames_per_episode, num_episodes,
-                           out_dir=os.path.join(RUN_DIR,"AoI Analysis"), ma_window=20)
-'''
-
-'''''''''
 plot_system_avg_aoi_timewise_strict_sqlite(
     conn, num_slots, frames_per_episode, num_episodes,
     out_dir=os.path.join(RUN_DIR,"AoI Analysis"),
     out_pdf="system_aoi_time_avg.pdf",
     rolling_window=300, include_per_slot_in_main=True
 )
-conn.close()
+
+plot_system_avg_aoi_sqlite_ma(conn, num_slots, frames_per_episode, num_episodes,
+                           out_dir=os.path.join(RUN_DIR,"AoI Analysis"), ma_window=20)
+
+
+plot_system_avg_aoi_timewise_strict_sqlite_var(
+    conn,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir =os.path.join(RUN_DIR,"AoI Analysis"),
+    out_pdf="system_aoi_time_avg_var.pdf",
+    rolling_window=100,            # e.g., 1000
+    include_per_slot_in_main=True,
+    save_avg_only=True,
+    avg_only_pdf="system_aoi_time_avg_only_var.pdf"
+)
+
+
+plot_system_avg_aoi_timewise_strict_sqlite_varuser(
+    conn,
+    num_slots,
+    frames_per_episode,
+    num_episodes,
+    out_dir =os.path.join(RUN_DIR,"AoI Analysis"),
+    out_pdf="system_aoi_time_avgvaru.pdf",
+    rolling_window=100,            # e.g., 1000
+    include_per_slot_in_main=True,
+    save_avg_only=True,
+    avg_only_pdf="system_aoi_time_avg_only_varu.pdf",
+    ep_end_var_ddof=0               # 0 = population variance, 1 = sample variance
+)
 '''
+
+# assuming your two SQLite DBs live inside:
+# RUN_DIR_PPO and RUN_DIR_RANDOM, with filenames like 'telemetry.sqlite'
+db_ppo    = os.path.join(RUN_DIR_PPO,    "slotwise_data.sqlite")
+db_random = os.path.join(RUN_DIR_RANDOM, "slotwise_data.sqlite")
+
+plot_compare_episode_end_avg_and_variance_sqlite(
+    db_path_ppo=db_ppo,
+    db_path_random=db_random,
+    num_slots=num_slots,
+    frames_per_episode=frames_per_episode,
+    num_episodes=num_episodes,
+    out_dir="comparisons",
+    out_pdf="PPO_vs_Random_episode_end_avg_var.pdf",
+    ddof=0,
+    sigma_shading=True
+)
+
+
+
 
 

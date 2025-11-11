@@ -15,34 +15,7 @@ import torch.nn.functional as F
 
 EPS = 1e-8
 
-class PPOActorCritic(nn.Module):
-    def __init__(self, state_dim, n_slots):
-        super().__init__()
-        self.n_slots = n_slots
-        self.f1 = nn.Linear(state_dim, 128)
-        self.f2 = nn.Linear(128, 128)
-        self.pi = nn.Linear(128, n_slots)
-        self.v = nn.Linear(128, 1)
 
-    def forward(self, states):
-        x = F.relu(self.f1(states))
-        x = F.relu(self.f2(x))
-        logits = self.pi(x)
-        value = self.v(x).squeeze(-1)
-        return logits, value
-
-    @torch.no_grad()
-    def act(self, state, slot_mask, greedy=False):
-        logits, value = self.forward(state)
-        probs = torch.softmax(logits + EPS, dim=-1) * slot_mask
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        dist = Categorical(probs)
-        if greedy:
-            a = torch.argmax(probs, dim=-1)
-        else:
-            a = dist.sample()
-        logp = dist.log_prob(a)
-        return a, logp, value, probs
 
 
 
@@ -58,68 +31,7 @@ class PPOActorCritic(nn.Module):
 # - per-user average AoI, system AoI tracking
 # - plotting integrat
 
-class Telemetry:
-    def __init__(self):
-        from collections import defaultdict
-        self.by_uid = defaultdict(list)
-        self._tick = 0
 
-    def tick(self):
-        self._tick += 1
-        return self._tick
-
-    def _parse_uid(self, u):
-        if hasattr(u, "uid"): raw = u.uid
-        else: raw = u
-        if isinstance(raw, int): return int(raw), f"U{int(raw)}"
-        if isinstance(raw, str):
-            import re
-            m = re.search(r"\\d+", raw)
-            if m: n = int(m.group(0)); return n, f"U{n}"
-        raise ValueError(f"Invalid uid: {u}")
-
-    def log_user(self, ep, u, frame, slot, kind, sinr, battery,
-                 harvested, required, decoded, aoi, distance,
-                 scheduled, pd_role):
-        uid_num, uid_str = self._parse_uid(u)
-        row = {
-            "ep": int(ep), "frame": int(frame), "slot": int(slot),
-            "uid": uid_num, "uid_str": uid_str, "step": self.tick(),
-            "kind": kind, "pd_role": pd_role,
-            "scheduled": int(bool(scheduled)), "decoded": int(bool(decoded)),
-            "required": int(bool(required)), "aoi": float(aoi),
-            "battery": float(battery), "harvested": float(harvested),
-            "sinr": float(sinr), "distance": float(distance)
-        }
-        self.by_uid[uid_num].append(row)
-
-    def clear_frame(self, ep, frame):
-        removed = 0
-        for uid in list(self.by_uid.keys()):
-            rows = self.by_uid[uid]
-            keep = [r for r in rows if not (r["ep"] == ep and r["frame"] == frame)]
-            removed += len(rows) - len(keep)
-            self.by_uid[uid] = keep if keep else self.by_uid.pop(uid)
-        return removed
-
-    def save_episode_npy(self, path="telemetry_episode.npy"):
-        data = dict(self.by_uid)
-        np.save(path, data)
-
-    def save_slotwise_dat(self, path="slotwise.dat"):
-        with open(path, "wb") as f:
-            pickle.dump(dict(self.by_uid), f)
-
-    def compute_average_aoi(self, total_slots):
-        uid_avg = {}
-        for uid, rows in self.by_uid.items():
-            aoi_sum = sum(r["aoi"] for r in rows)
-            uid_avg[uid] = aoi_sum / total_slots
-        return uid_avg
-
-    def compute_system_aoi(self, total_slots):
-        user_avgs = self.compute_average_aoi(total_slots)
-        return sum(user_avgs.values()) / len(user_avgs)
 
 # PPOAgent, assign_slots_for_frame, plot_all_users_aoi(), and plot_all_users_energy()
 # would also be included from your finalized PPO policy and visual functions.
@@ -168,12 +80,12 @@ set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------- Environment params (yours) -------------------
-num_slots          = 7
-frames_per_episode = 1000
-num_episodes       = 30
-M_total            = 19
-K_clusters         = 1
-KF_clusters        = 4
+num_slots          = 3
+frames_per_episode = 2000
+num_episodes       = 10
+M_total            = 10
+K_clusters         = 3
+KF_clusters        = 6
 K_r_user           = 12.0
 alpha_c            = 0.25
 beta_c             = 1.0
@@ -185,16 +97,16 @@ gamma_th_db        = 0
 gamma_th           = 10 ** (gamma_th_db / 10.0)
 v_L                = 0.5
 v_H                = gamma_th * (1.0 + v_L)
-drop_prob          = 0.6
+drop_prob          = 0.4
 D                  = 8.0
 tau                = D / np.sqrt(2.0)  # near/far threshold by your spec
-battery_max = 2
+battery_max = 1
 
 # ------------------- PPO params (plottable & stable) -------------------
 state_dim    = 12        # [A_near, A_far, dA_near, dA_far, success_near, success_far]
-lr           = 1e-2     # stable default
-ppo_epochs   = 2
-batch_size_I   = 200
+lr           = 3e-5     # stable default
+ppo_epochs   = 3
+batch_size_I   = 100
 gamma_I        = 0.99
 lam_I          = 0.9
 clip_range_I   = 0.1
@@ -217,9 +129,9 @@ EVAL_EPISODES  = 30      # (used later if you run a frozen-policy eval)
 #### _________________ Greedy Actions________ ####
 
 # set once before training
-epsilon_start = 0.25   # 20% random at the beginning
+epsilon_start = 0.05   # 20% random at the beginning
 epsilon_final = 0.005   # floor
-decay_steps   = 500000 # decisions/frames to reach the floor (tune as you like)
+decay_steps   = 100000 # decisions/frames to reach the floor (tune as you like)
 global_step = 0  # increment this once per decision (or per slot), not per episode
 
 import os, datetime, numpy as np
@@ -311,11 +223,8 @@ def epsilon_schedule(step):
     return epsilon_final + (epsilon_start - epsilon_final) * frac
 # ------------------- Utility -------------------
 def masked_softmax(logits, mask, dim=-1):
-    """Numerically-stable masked softmax: mask 1=valid, 0=invalid."""
-    mask = mask.to(logits.dtype)
-    neg_inf = torch.finfo(logits.dtype).min
-    masked = logits + (mask + EPS).log()  # add log(mask) ~ 0 or -inf
-    # Alternatively: masked = logits.masked_fill(mask < 0.5, neg_inf)
+    very_neg = torch.finfo(logits.dtype).min
+    masked = logits.masked_fill(mask < 0.5, very_neg)
     return torch.softmax(masked, dim=dim)
 
 def rician_power(K_r):
@@ -329,6 +238,33 @@ def rician_power(K_r):
 def sepl_gain(d, alpha_c, beta_c):
     """SEPL large-scale power gain: exp(-alpha_c * d^beta_c)."""
     return math.exp(-alpha_c * (d ** beta_c))
+
+def delete_temp_files(mm_dir):
+    """
+    Delete all .dat temporary files in the mm_dir folder.
+    """
+    try:
+        # Get all .dat files in the mm directory
+        temp_files = [f for f in os.listdir(mm_dir) if f.endswith('.dat')]
+
+        # Delete each .dat file
+        for temp_file in temp_files:
+            file_path = os.path.join(mm_dir, temp_file)
+            try:
+                os.remove(file_path)
+                print(f"[DELETE] Deleted temporary file: {file_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to delete file {file_path}: {e}")
+
+        # Optionally, remove the mm directory if it is empty
+        try:
+            os.rmdir(mm_dir)
+            print(f"[DELETE] Deleted mm directory: {mm_dir}")
+        except Exception as e:
+            print(f"[ERROR] Failed to remove directory {mm_dir}: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to delete temporary files: {e}")
 
 # ------------------- User state -------------------
 class UserState:
@@ -360,10 +296,10 @@ class UserState:
         self.belief_energy = 0.0
         self.energy_per_slot = energy_per_slot
 
-        self.scheduled_count = 0
-        self.success_count = 0
-        self.belief_psuccess = 0.5  # initial belief
-
+        #self.scheduled_count = 0
+        #self.success_count = 0
+        #self.belief_psuccess = 0.5  # initial belief
+        self.slot_add_schedule = 0
         self.scheduled_count = 0
         self.success_count = 0
         self.belief_psuccess = 0.5  # initial belief
@@ -436,7 +372,7 @@ class UserState:
 
 
 # ------------------- Inter-cell interference (cross-link only) -------------------
-def intercell_interference(K_clusters, alpha_c, beta_c, v_H, v_L, d_cross_rng=(40.0, 60.0), K_r_cross=KF_clusters):
+def intercell_interference(K_clusters, alpha_c, beta_c, v_H, v_L, d_cross_rng=(10.0, 16.0), K_r_cross=KF_clusters):
     """
     Sum of power from (K_clusters-1) other clusters, each with one high & one low user.
     We compute received power at our HAP using SEPL(d_cross)*|h|^2 multiplied by that user's
@@ -736,7 +672,7 @@ def compute_gae(rewards, values, dones, gamma=gamma_I, lam=lam_I):
 
 def ppo_update(policy, buffer, optimizer,
                epochs = ppo_epochs, batch_size=batch_size_I,
-               clip_range=clip_range_I, ent_coef=ent_coef_I, vf_coef=ent_coef_I, max_grad_norm=max_grad_norm_I,
+               clip_range=clip_range_I, ent_coef=ent_coef_I, vf_coef=vf_coef_I, max_grad_norm=max_grad_norm_I,
                gamma=gamma_I, lam=lam_I):
     policy.train()
     T = len(buffer)
@@ -849,7 +785,7 @@ def build_pair_state(uN, uF):
 
     A_n, A_f = _safe(uN.aoi, 0, 1e6), _safe(uF.aoi, 0, 1e6)
     dA_n, dA_f = _safe(uN.delta_aoi_prev, -1e6, 1e6), _safe(uF.delta_aoi_prev, -1e6, 1e6)
-    dec_n, dec_f = _safe(uN.last_decoded_slot, 0, 1e6), _safe(uF.last_decoded_slot, 0, 1e6)
+    dec_n, dec_f = _safe(uN.slot_add_schedule, 0, 1e6), _safe(uF.slot_add_schedule, 0, 1e6)
     dist_n, dist_f = _safe(uN.d, 0, 1e6), _safe(uF.d, 0, 1e6)
     belief_e_n, belief_e_f = _safe(uN.belief_energy, 0, 1e6), _safe(uF.belief_energy, 0, 1e6)
     psucc_n, psucc_f = _safe(uN.belief_psuccess, 0, 1), _safe(uF.belief_psuccess, 0, 1)
@@ -860,13 +796,13 @@ def build_pair_state(uN, uF):
     ], dtype=np.float32)
 
     # last line of defense:
-    s = np.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
+    #s = np.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
     return s
 
 
 def make_run_dir(M_total, num_slots):
     #stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"AoI_U{M_total}_S{num_slots}_SLT"
+    name = f"AoI_U{M_total}_S{num_slots}_DP"
     out = os.path.join(name)
     os.makedirs(out, exist_ok=True)
     return out
@@ -985,23 +921,39 @@ class PPOActorCritic(nn.Module):
         return a, logp, value, probs
 
 
+import os
+import numpy as np
+import gc
+from collections import defaultdict
+
+
 class Telemetry:
-    def __init__(self):
+    def __init__(self, run_dir, M_total, num_slots, num_episodes):
         self.by_uid = defaultdict(list)
         self._tick = 0
+        self._frame_scratch = {}
+        self.run_dir = run_dir
+        self.M_total = M_total
+        self.num_slots = num_slots
+        self.num_episodes = num_episodes
 
-    @staticmethod
-    @staticmethod
-    def _parse_uid(u):
+        # Create a temporary directory to hold memory-mapped file
+        self.mm_dir = os.path.join(run_dir, "mm")
+        os.makedirs(self.mm_dir, exist_ok=True)
+
+        # Temporary memory-mapped file: one file for the entire run
+        # The shape is num_episodes x (num_slots * num_frames)
+        self.temp_data_mm = np.memmap(
+            os.path.join(self.mm_dir, f"temp_slotwise_data_U{M_total}S{num_slots}.dat"),
+            dtype=np.float32, mode="w+", shape=(num_episodes, self.num_slots * 100)  # Change shape as needed
+        )
+
+    def _parse_uid(self, u):
         """
         Accepts a UserState (with .uid like 'U32'), a string 'U32'/'32',
         or an int 32. Returns (uid_num:int, uid_str:str).
         """
-        # UserState
-        if hasattr(u, "uid"):
-            raw = u.uid
-        else:
-            raw = u
+        raw = getattr(u, "uid", u)
 
         # string like 'U2' or '2'
         if isinstance(raw, str):
@@ -1009,12 +961,12 @@ class Telemetry:
             if m:
                 n = int(m.group(0))
                 return n, f"U{n}"
-            else:
-                raise ValueError(f"String uid must contain a number: {raw!r}")
+            raise ValueError(f"String uid must contain a number: {raw!r}")
 
         # integer
         if isinstance(raw, (int, np.integer)):
-            return int(raw), f"U{int(raw)}"
+            n = int(raw)
+            return n, f"U{n}"
 
         raise ValueError(f"Invalid uid: {u!r} (expected UserState/int/'U#')")
 
@@ -1025,6 +977,9 @@ class Telemetry:
     def log_user(self, ep, u, frame, slot, kind, sinr, battery,
                  harvested, required, decoded, aoi, distance,
                  scheduled, pd_role):
+        """
+        Logs data for the current episode (doesn't append indefinitely).
+        """
         uid_num, uid_str = self._parse_uid(u)
         row = {
             "ep": int(ep),
@@ -1033,8 +988,8 @@ class Telemetry:
             "uid": uid_num,
             "uid_str": uid_str,
             "step": self.tick(),
-            "kind": str(kind) if kind else "",
-            "pd_role": str(pd_role) if pd_role else "",
+            "kind": (str(kind) if kind else ""),
+            "pd_role": (str(pd_role) if pd_role else ""),
             "scheduled": int(bool(scheduled)),
             "decoded": int(bool(decoded)),
             "required": int(bool(required)),
@@ -1043,111 +998,82 @@ class Telemetry:
             "harvested": float(harvested) if harvested is not None else 0.0,
             "sinr": float(sinr) if sinr is not None else 0.0,
             "distance": float(distance) if distance is not None else 0.0,
-
         }
-        self.by_uid[uid_num].append(row)
 
-    def export_frame_csv(self, run_dir, ep, frame, filename="telemetry_rows.csv", warn_missing=True):
-        os.makedirs(run_dir, exist_ok=True)
-        path = os.path.join(run_dir, filename)
-        write_header = not os.path.exists(path)
-        missing_ct, written_ct = 0, 0
+        # Create a temporary data structure for this episode's log
+        if ep not in self.by_uid:
+            self.by_uid[ep] = {}
 
-        with open(path, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(["ep","frame","slot","uid","uid_str","step","kind","pd_role",
-                            "scheduled","decoded","required","aoi","battery",
-                            "harvested","sinr","distance"])
+        if uid_num not in self.by_uid[ep]:
+            self.by_uid[ep][uid_num] = []
 
-            for uid_num, rows in list(self.by_uid.items()):
-                for r in rows:
-                    r_ep = r.get("ep"); r_fr = r.get("frame")
-                    if r_ep is None or r_fr is None:
-                        missing_ct += 1
-                        continue
-                    if r_ep == ep and r_fr == frame:
-                        w.writerow([
-                            r_ep, r_fr, r.get("slot", 0), r.get("uid", uid_num),
-                            r.get("uid_str", f"U{uid_num}"), r.get("step", 0),
-                            r.get("kind",""), r.get("pd_role",""),
-                            int(bool(r.get("scheduled", 0))),
-                            int(bool(r.get("decoded", 0))),
-                            int(bool(r.get("required", 0))),
-                            float(r.get("aoi", 0.0)), float(r.get("battery", 0.0)),
-                            float(r.get("harvested", 0.0)), float(r.get("sinr", 0.0)),
-                            float(r.get("distance", 0.0))
-                        ])
-                        written_ct += 1
+        self.by_uid[ep][uid_num].append(row)  # Log only for the current episode
 
-        if warn_missing and missing_ct:
-            print(f"[telemetry] export_frame_csv: skipped {missing_ct} malformed row(s) (ep={ep}, frame={frame}).")
-        return written_ct
-
-    def clear_frame(self, ep, frame):
-        removed = 0
-        for uid_num in list(self.by_uid.keys()):
-            rows = self.by_uid[uid_num]
-            keep = [r for r in rows if not (r.get("ep") == ep and r.get("frame") == frame)]
-            removed += len(rows) - len(keep)
-            if keep:
-                self.by_uid[uid_num] = keep
-            else:
-                del self.by_uid[uid_num]
-        return removed
-
-    from pathlib import Path
-    import numpy as np
-    from pathlib import Path
-
-    def save_episode_npy(self, run_dir, filename="episode_data.npy"):
+    def flush_episode_to_temp_file(self, ep):
         """
-        Save the episode-wise telemetry data (.npy) into the specified run directory.
+        Save the logged data for the current episode into the temporary memory file.
+        Then clear the logged data for the current episode.
         """
-        import os
-        os.makedirs(run_dir, exist_ok=True)
-        path = os.path.join(run_dir, filename)
+        if ep not in self.by_uid or not self.by_uid[ep]:
+            return
 
-        data = dict(self.by_uid)
-        np.save(path, data)
-        print(f"[SAVE] Saved episode data to {path}")
+        # Reset the memory-mapped file for the new episode
+        episode_filename = os.path.join(self.mm_dir,
+                                        f"temp_slotwise_data_ep{ep:04d}_U{self.M_total}S{self.num_slots}.dat")
 
-    def save_slotwise_dat(self, run_dir, filename="slotwise_data.dat"):
+        # Write the current episode's data into the memory-mapped file
+        with open(episode_filename, "wb") as f:
+            # Save only the data for the current episode
+            episode_data = self.by_uid[ep]  # Get the data for this episode only
+            np.save(f, episode_data)  # Save the data to the temporary file
+
+        # After saving, clear memory for the current episode
+        self.by_uid[ep].clear()  # This ensures that only the current episode data is saved and not carried forward
+        gc.collect()  # Collect garbage to free memory
+
+        print(f"[FLUSH] Episode {ep} data saved to temporary memory file at {episode_filename}.")
+
+    def finalize_run(self, run_dir, final_filename="slotwise_dataU{M_total}S{num_slots}.npy", keep_chunks=True):
         """
-        Save complete slotwise raw data (.dat) for later loading.
+        Merge all episode data into one final .npy file.
         """
-        import os, pickle
-        os.makedirs(run_dir, exist_ok=True)
-        path = os.path.join(run_dir, filename)  # ✅ build full file path
+        if final_filename is None:
+            final_filename = f"slotwise_dataU{self.M_total}S{self.num_slots}.npy"
 
-        with open(path, "wb") as f:
-            pickle.dump(self.by_uid, f)
+        final_path = os.path.join(run_dir, final_filename)
+        merged = defaultdict(list)
 
-    def save_slotwise_npy(self, run_dir, filename="slotwise_data.npy"):
-        """
-        Save complete slotwise telemetry data in .npy format.
-        """
-        import os
-        os.makedirs(run_dir, exist_ok=True)
-        path = os.path.join(run_dir, filename)
-        np.save(path, self.by_uid)
-        print(f"[SAVE] Saved slotwise data to {path}")
+        # Merge data from all episodes
+        for ep in range(1, self.num_episodes+1):
+            episode_filename = os.path.join(self.mm_dir,
+                                            f"temp_slotwise_data_ep{ep:04d}_U{self.M_total}S{self.num_slots}.dat")
+            try:
+                with open(episode_filename, "rb") as f:
+                    data = np.load(f, allow_pickle=True).item()
+                    for uid, rows in data.items():
+                        merged[uid].extend(rows)
+            except Exception as e:
+                print(f"[FINAL] Failed to read episode data {episode_filename}: {e}")
+
+        # Write merged data to final file
+        np.save(final_path, dict(merged), allow_pickle=True)
+        print(f"[FINAL] Data merged and saved to {final_path}")
+
+        # Optionally, remove the chunk files if keep_chunks is False
+        if not keep_chunks:
+            for ep in range(self.num_episodes):
+                episode_filename = os.path.join(self.mm_dir,
+                                                f"temp_slotwise_data_ep{ep:04d}_U{self.M_total}S{self.num_slots}.dat")
+                try:
+                    os.remove(episode_filename)
+                except Exception as e:
+                    print(f"[FINAL] Failed to remove episode data {episode_filename}: {e}")
+            try:
+                os.rmdir(self.mm_dir)
+            except Exception as e:
+                print(f"[FINAL] Failed to remove chunk directory {self.mm_dir}: {e}")
 
 
-    def compute_average_aoi(self, total_slots):
-        uid_avg = {}
-
-        for uid, rows in self.by_uid.items():
-            aoi_sum = sum(r["aoi"] for r in rows)
-            uid_avg[uid] = aoi_sum / total_slots
-        return uid_avg
-
-    def compute_system_aoi(self, total_slots):
-        user_avgs = self.compute_average_aoi(total_slots)
-
-        return sum(user_avgs.values()) / len(user_avgs)
-
-telemetry = Telemetry()
 # The remaining logic for state construction, slot assignment, frame rollout,
 # .dat and .npy file generation, average AoI tracking, belief model for decoding probability,
 # and plotting routines should now be added below step-by-step.
@@ -1318,6 +1244,7 @@ def assign_slots_for_frame(
             states_to_buffer, masks_to_buffer, values_to_buffer, logps_to_buffer, actions_to_buffer,
             idx_by_slot, slot_mask)
 
+
 def compute_average_aoi(telemetry, num_slots, num_frames, out_dir):
     """
     Computes moving average AoI for each user and system at the end of an episode.
@@ -1332,30 +1259,46 @@ def compute_average_aoi(telemetry, num_slots, num_frames, out_dir):
     avg_per_user = {}
     total_time = num_slots * num_frames
 
-    for uid, rows in telemetry.by_uid.items():
-        rows_sorted = sorted(rows, key=lambda r: r["step"])
-        aoi_values = [r["aoi"] for r in rows_sorted]
+    # Iterate through all users in telemetry data
+    for uid, episodes in telemetry.by_uid.items():
+        # Initialize an empty list to store AoI values
+        aoi_values = []
+
+        # Iterate through each episode for the user
+        for ep, rows in episodes.items():  # Iterate over each episode
+            # Sort rows by the 'step' (or tick) value to maintain chronological order
+            rows_sorted = sorted(rows, key=lambda r: r["step"])
+
+            # Collect AoI values for the current episode
+            aoi_values.extend([r["aoi"] for r in rows_sorted])
+
+        # Calculate moving average for AoI
         cumulative_sum = np.cumsum(aoi_values)
         time_indices = np.arange(1, len(aoi_values) + 1)
         moving_avg = cumulative_sum / time_indices
+
+        # Final moving average for the user (last value)
         final_avg = moving_avg[-1] if moving_avg.size > 0 else 0.0
         avg_per_user[f"U{uid}"] = final_avg
 
+    # Calculate the system average AoI (mean of user averages)
     system_avg = np.mean(list(avg_per_user.values()))
 
-    # Save to .dat
+    # Save the average AoI results to a .dat file
     dat_path = os.path.join(out_dir, "avg_aoi_summary.dat")
     with open(dat_path, "w") as f:
         for uid, avg in avg_per_user.items():
             f.write(f"{uid}: {avg:.4f}\n")
         f.write(f"\nSystem Average AoI: {system_avg:.4f}\n")
 
-    # Save to .npy
+    # Save the average AoI per user to a .npy file
     npy_path = os.path.join(out_dir, "avg_aoi_per_user.npy")
     np.save(npy_path, avg_per_user)
 
     print(f"[SAVE] Saved AoI summary to {dat_path}")
     return system_avg
+
+
 
 def plot_all_users_aoi(telemetry, num_slots, frames_per_episode, out_pdf="AOI_All_Users.pdf", out_dir="telemetry_plots"):
     import os, math, numpy as np, matplotlib as mpl, matplotlib.pyplot as plt
@@ -1866,6 +1809,74 @@ def plot_moving_avg_aoi_per_user(
     plt.close(fig)
     print(f"[PLOT] Saved All Users Moving Avg AoI → {out_path}")
 
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+def plot_userwise_and_system_avg_aoi(npy_file_path, out_dir, num_users):
+    """
+    Loads the user-wise average AoI data from the .npy file and computes
+    the system average per episode. Then, it plots the user-wise AoI and
+    system average AoI over episodes.
+
+    Parameters:
+    - npy_file_path (str): Path to the 'avg_aoi_per_user.npy' file.
+    - out_dir (str): Directory where the plots will be saved.
+    - num_users (int): Number of users.
+    """
+    # Construct the path for avg_aoi_per_user.npy file
+    npy_file_path = os.path.join(npy_file_path, "avg_aoi_per_user.npy")
+
+    # Load the data from the .npy file
+    avg_aoi_per_user = np.load(npy_file_path, allow_pickle=True).item()
+    # Create output directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+
+    # List of episodes (since we don't have a dedicated episode field,
+    # we'll just assume that the number of episodes corresponds to the length
+    # of the user averages).
+    episodes = len(avg_aoi_per_user)
+
+    # Prepare data for plotting
+    episode_indices = np.arange(1, episodes + 1)
+    system_avg_per_episode = []
+    userwise_aoi_data = {user: [] for user in avg_aoi_per_user}
+
+    # Calculate user-wise AoI per episode and system average per episode
+    for episode in episode_indices:
+        user_averages = []
+        for user, avg_aoi in avg_aoi_per_user.items():
+            user_averages.append(avg_aoi)
+            userwise_aoi_data[user].append(avg_aoi)
+
+        # System average for the episode: sum of user averages / number of users
+        system_avg = np.mean(user_averages) if user_averages else 0.0
+        system_avg_per_episode.append(system_avg)
+
+    # Plotting the user-wise AoI and system average AoI
+    plt.figure(figsize=(10, 6))
+
+    # Plot for each user
+    for user, aoi_data in userwise_aoi_data.items():
+        plt.plot(episode_indices, aoi_data, label=f"User {user}", marker='o')
+
+    # Plot for system average AoI
+    plt.plot(episode_indices, system_avg_per_episode, label="System Avg AoI", color="black", linestyle='--', linewidth=2)
+
+    # Adding labels and title
+    plt.xlabel("Episode")
+    plt.ylabel("AoI")
+    plt.title("User-wise and System Average AoI over Episodes")
+    plt.legend(loc="upper left", fontsize=8)
+    plt.grid(True)
+
+    # Save the plot
+    plot_path = os.path.join(out_dir, "userwise_and_system_avg_aoi_plot.pdf")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=600, format="pdf")
+    plt.close()
+
+    print(f"[PLOT] Saved the plot to {plot_path}")
 
 
 
@@ -2048,15 +2059,30 @@ recorder = None
 #users = [UserState(f"U{i+1}", d_init=np.random.uniform(1.0, D)) for i in range(M_total)]
 users = []
 
-# First half: near users, distance ∈ [1, D/2]
-for i in range(M_total // 2):
-    d_init = np.random.uniform(1.0, D / 2)
-    users.append(UserState(f"U{i+1}", d_init=d_init, max_bat = battery_max))
+def reset_users(M_total, D, battery_init = 0.01):
+    # First half: near users, distance ∈ [1, D/2]
+    for i in range(M_total // 2):
+        d_init = np.random.uniform(1.0, D / 2)
+        users.append(UserState(f"U{i + 1}", d_init=d_init, max_bat=battery_init))
 
-# Second half: far users, distance ∈ [D/2 + 0.1, D]
-for i in range(M_total // 2, M_total):
-    d_init = np.random.uniform(D / 2 + 0.1, D)
-    users.append(UserState(f"U{i+1}", d_init=d_init, max_bat = battery_max))
+    # Second half: far users, distance ∈ [D/2 + 0.1, D]
+    for i in range(M_total // 2, M_total):
+        d_init = np.random.uniform(D / 2 + 0.1, D)
+        users.append(UserState(f"U{i + 1}", d_init=d_init, max_bat=battery_init))
+    # initial channel sample & AoI
+    for i, u in enumerate(users):
+        u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
+        u.aoi = 1
+        u.aoi_prev = 1
+        u.aoi_sum = 0.0
+        u.aoi_count = 0
+        u.decode = 0
+        u.succ_ema = 0.5
+        u.last_decoded = 0
+        u.last_slot_used = None
+        u.assigned_this_frame = False
+        # u.battery = 0.1
+        # aoi_users[i, 0] = u.aoi
 
 stop_counter = 0
 stopped_at_ep = None
@@ -2072,41 +2098,36 @@ Run_mode = "ppo"  # "ppo" | "greedy" | "random" | "threshold"
 EP_Reward_sum = []
 decision_timeline = []  # global list[DecisionLog]
 
-
-# initial channel sample & AoI
-for i, u in enumerate(users):
-    u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
-    # u.aoi = 1
-    # u.aoi_prev = 1
-    # u.aoi_sum = 0.0
-    # u.aoi_count = 0
-    u.decode = 0
-    u.succ_ema = 0.5
-    u.last_decoded = 0
-    u.last_slot_used = None
-    u.assigned_this_frame = False
-    # u.battery = 0.1
-    # aoi_users[i, 0] = u.aoi
+reset_users(M_total, D, battery_init=0.02)
 
 # initial grouping
 near_all, far_all = split_groups_by_distance(users, tau)
 allowed_near, idle_near, allowed_far, idle_far = init_allowed_idle(near_all, far_all, num_slots)
 #telemetry = new_buffer()  # episode buffer
+telemetry = Telemetry(RUN_DIR, M_total, num_slots, num_episodes)
 
 for ep in range(1, num_episodes + 1):
 
     for i, u in enumerate(users):
+        u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
+
+
+    # initial grouping
+    near_all, far_all = split_groups_by_distance(users, tau)
+    allowed_near, idle_near, allowed_far, idle_far = init_allowed_idle(near_all, far_all, num_slots)
+
+    #for i, u in enumerate(users):
         #u.sample_channel_and_gamma(K_r_user, alpha_c, beta_c)
-        # u.aoi = 1
-        # u.aoi_prev = 1
-        # u.aoi_sum = 0.0
-        # u.aoi_count = 0
-        u.decode = 0
-        u.succ_ema = 0.5
-        u.last_decoded = 0
-        u.last_slot_used = None
-        u.assigned_this_frame = False
-        # u.battery = 0.1
+        #u.aoi = 1
+        #u.aoi_prev = 1
+        #u.aoi_sum = 0.0
+        #u.aoi_count = 0
+     #   u.decode = 0
+      #  u.succ_ema = 0.5
+      #  u.last_decoded = 0
+      #  u.last_slot_used = None
+      #  u.assigned_this_frame = False
+        #u.battery = 0.001
         # aoi_users[i, 0] = u.aoi
 
 
@@ -2160,12 +2181,15 @@ for ep in range(1, num_episodes + 1):
                 u.aoi += 1
                 #u.decode = 0
                 u.last_decoded_slot += 1
+                u.slot_add_schedule += 1
             scheduled = {}
             if sl in slot_map:
                 entry = slot_map[sl]
                 if entry.__class__ is tuple and len(entry) == 2 and isinstance(entry[0], UserState):
                     # ("pair", (uN,uF), s)
                     uN, uF = entry
+                    uN.slot_add_schedule = 0
+                    uF.slot_add_schedule = 0
                     dec_H, dec_L, sinr_H, sinr_L, battH, battL, reqH, reqL = decode_pair_pd_noma(
                         uN, uF, v_H, v_L, gamma_th, noise_pow, K_clusters,
                         alpha_c, beta_c, delta_wet, delta_wit, P_HAP
@@ -2202,15 +2226,25 @@ for ep in range(1, num_episodes + 1):
 
                     k = idx_by_slot.get(sl, 0)
                     if k is not None:
-                        buffer.add(
+                        if sl == num_slots-1:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                1  # not done within the frame
+                            )
+                        else:
+                            buffer.add(
                             states_to_buffer[k],
                             masks_to_buffer[k],
                             torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
                             logps_to_buffer[k],
                             values_to_buffer[k],
                             r_t,  # scalar float is fine for most buffers
-                            0.0  # not done within the frame
-                        )
+                            0.0 ) # not done within the frame
                     # pair (NOMA)
                     scheduled[uN.uid] = dict(kind="NOMA-H", sinr=sinr_H, battery=battH,
                                              harvested=uN.harvested, required=reqH, decoded=int(dec_H),
@@ -2231,6 +2265,7 @@ for ep in range(1, num_episodes + 1):
                     # ("single", u, s)
                     entry = slot_map[sl]
                     u_single = entry
+                    u_single.slot_add_schedule = 0
                     dec, sinr, batt, req = decode_single_oma(u_single, v_H, gamma_th, noise_pow, K_clusters, alpha_c, beta_c, delta_wet, delta_wit, P_HAP)
 
                     if dec:
@@ -2254,15 +2289,26 @@ for ep in range(1, num_episodes + 1):
 
                     k = idx_by_slot.get(sl, 0)
                     if k is not None:
-                        buffer.add(
-                            states_to_buffer[k],
-                            masks_to_buffer[k],
-                            torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
-                            logps_to_buffer[k],
-                            values_to_buffer[k],
-                            r_t,  # scalar float is fine for most buffers
-                            0.0  # not done within the frame
-                        )
+                        if sl == num_slots-1:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                1  # not done within the frame
+                            )
+                        else:
+                            buffer.add(
+                                states_to_buffer[k],
+                                masks_to_buffer[k],
+                                torch.tensor(actions_to_buffer[k], dtype=torch.long, device=device),
+                                logps_to_buffer[k],
+                                values_to_buffer[k],
+                                r_t,  # scalar float is fine for most buffers
+                                0.0  # not done within the frame
+                            )
 
 
                     scheduled[u_single.uid] = dict(kind="OMA", sinr=sinr, battery=batt,
@@ -2333,40 +2379,43 @@ for ep in range(1, num_episodes + 1):
                                                                                    idle_far, tau)
 
     system_avg = compute_average_aoi(telemetry, num_slots, frames_per_episode, RUN_DIR)
-    print(f"[Episode {ep + 1}] System Avg AoI: {system_avg:.3f}")
+    print(f"[Episode {ep}] System Avg AoI: {system_avg:.3f}")
 
     if ep % 1 == 0 or ep == 1:
         print(f"Ep {ep:4d}/{num_episodes}" ) #| AvgAoI={aoi_avg_ep[-1]:6.3f} | "
               #f"π_loss={stats['pi_loss']:.4f} | V_loss={stats['v_loss']:.4f} | "
               #f"Ent={stats['ent']:.4f} | KL={stats['kl']:.4f}")
-    telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
-    telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
+    #telemetry.save_episode_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
+    #telemetry.save_slotwise_npy(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
+        # After logging, flush data for the episode:
+    telemetry.flush_episode_to_temp_file(ep)
 
 
 
 #episode_data = np.load(os.path.join(RUN_DIR, "episode_data.npy"), allow_pickle=True).item()
 
-per_user_moving = compute_moving_avg_aoi_per_user(telemetry)
-user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(telemetry, num_slots)
-user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(telemetry)
+#per_user_moving = compute_moving_avg_aoi_per_user(telemetry)
+#user_frame_aoi, system_frame_aoi = compute_avg_aoi_per_frame(telemetry, num_slots)
+#user_ep_aoi, system_ep_aoi = compute_avg_aoi_per_episode(telemetry)
 
 sar_logger.save(RUN_DIR, filename=f"sar_logU{M_total}S{num_slots}.pkl")
 
+telemetry.finalize_run(run_dir=RUN_DIR, final_filename=f"slotwise_dataU{M_total}S{num_slots}.npy", keep_chunks=True)
 # Example print:
-for ep, avg in system_ep_aoi.items():
-    print(f"Episode {ep}: System Avg AoI = {avg:.3f}")
+#for ep, avg in system_ep_aoi.items():
+ #   print(f"Episode {ep}: System Avg AoI = {avg:.3f}")
 
 data = load_episode_telemetry(RUN_DIR, filename=f"slotwise_dataU{M_total}S{num_slots}.npy")
 #plot_all_users_avg_aoi_combined(data, num_slots=num_slots, frames_per_episode=frames_per_episode, num_episodes = num_episodes ,out_dir="AoI_U6_S2_PPNR")
-plot_moving_avg_aoi_per_user(
-    data=data,
-    num_slots=num_slots,
-    frames_per_episode=frames_per_episode,
-    num_episodes=num_episodes,
-    out_dir=RUN_DIR,
-    out_pdf="All_Users_MovingAvgAoICluster2.pdf",
-    episode_tick=5
-)
+#plot_moving_avg_aoi_per_user(
+#    data=data,
+ #   num_slots=num_slots,
+ #   frames_per_episode=frames_per_episode,
+ #   num_episodes=num_episodes,
+  #  out_dir=RUN_DIR,
+  #  out_pdf="All_Users_MovingAvgAoICluster2.pdf",
+  #  episode_tick=5
+#)
 plot_system_avg_aoi(data, num_slots=num_slots, frames_per_episode=frames_per_episode,  out_dir=RUN_DIR, out_pdf="system_avg_aoicluster2.pdf")
 
 #plot_slotwise_rewards(RUN_DIR, out_dir=RUN_DIR, window=10)
@@ -2375,3 +2424,6 @@ plot_time_averaged_system_aoi(data, num_slots, frames_per_episode, RUN_DIR, out_
 
 #plot_all_users_aoi(telemetry, num_slots, frames_per_episode,  out_pdf="AOI_All_Users.pdf", out_dir=RUN_DIR)
 #plot_all_users_energy(telemetry, num_slots, frames_per_episode, out_pdf="Energy_All_Users.pdf", out_dir=RUN_DIR)
+plot_userwise_and_system_avg_aoi(RUN_DIR, RUN_DIR, M_total)
+
+delete_temp_files(os.path.join(RUN_DIR, "mm"))
