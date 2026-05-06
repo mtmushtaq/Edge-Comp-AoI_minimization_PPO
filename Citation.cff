@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Mushtaq"
+  given-names: "Muhammad Tauseef"
+  orcid: "https://orcid.org/0009-0009-8553-5680"
+title: "AoI_PD_NOMA_PPO2"
+version: 1.0.0
+doi: 10.5281/zenodo.1234
+date-released: 2026-05-06
+url: "https://github.com/mtmushtaq/AoI_PD_NOMA_PPO2"
