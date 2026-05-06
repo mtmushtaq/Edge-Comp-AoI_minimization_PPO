@@ -81,7 +81,6 @@ The framework combines:
   γ_th ∈ {−20, −10, −5, 0} dB.
 
 ---
-
 ## Contact
 
 **Muhammad Tauseef Mushtaq**
