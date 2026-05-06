@@ -82,4 +82,11 @@ The framework combines:
 
 ---
 
-## Repository Structure
+## Contact
+
+**Muhammad Tauseef Mushtaq**
+PhD Candidate, Department of Electrical and Information Engineering
+Politecnico di Bari, Italy
+📧 m.mushtaq@phd.poliba.it
+🔗 https://www.linkedin.com/in/your-profile   ← optional
+🌐 https://your-website.com                   ← optional
