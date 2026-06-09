@@ -81,6 +81,27 @@ The framework combines:
   γ_th ∈ {−20, −10, −5, 0} dB.
 
 ---
+
+## Directory Structure
+
+**Main Simulators/**  
+Holds the four core simulation scripts and any helpers:  
+• `PD_NOMA_AoI.py` – PPO-based Scheduling for AoI minimization with PD-NOMA  
+• `PD_NOMA__Random.py` – IRSA (Irregular Repeated Slotted ALOHA) baseline  
+• `PD_NOMA_AoI_Greedy.py` – Highest AoI user always gets scheduled first 
+• `PD_NOMA_AoI_Threshold.py` – Users who violate the highest AoI threshold always get priority 
+• plus any utility modules (e.g. config loaders, common functions)
+
+**Results/**  
+All the performance results/comparisons from simulators are in PDF and PNG formats.
+
+**Comparison Plot Codes/**  
+Scripts that generate the paper’s plots (for example, `plot_aoi_comparison.py` or `plot_energy_vs_age.py`).
+
+**Extra PDF Plots/**  
+High-resolution PDF versions of key figures, ready to drop into slides or manuscripts.
+
+
 ## Contact
 
 **Muhammad Tauseef Mushtaq**
